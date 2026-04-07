@@ -50,43 +50,105 @@ invisible(lapply(pkgs, function(p) {
 
 # 1. Problem Framing {#sec-framing}
 
-<!-- ─────────────────────────────────────────────────────────────────────────
-     SECTION 1: PROBLEM FRAMING
-     Goal: Establish the investment mandate and motivate why an investor
-           should pay for active management instead of simply holding SPY.
-     Content to write:
-       • Opening hook — the passive vs. active management debate
-       • "Markets as ecosystems" mental model: regimes shift, sectors rotate
-       • Investment mandate: long Growth, short Defensive, flat Neutral
-       • Strategy objectives: superior risk-adjusted return vs. SPY benchmark
-       • Brief road-map of how the rest of the document answers the question
-     ──────────────────────────────────────────────────────────────────────── -->
+## The Question Every Active Manager Must Answer
 
-<!-- TODO: Write narrative prose for Problem Framing -->
+The S&P 500 index returned approximately 10.5% annualised over the past century. An investor who bought SPY in June 2000 and held it through December 2024 would have compounded their capital through the dot-com collapse, the Global Financial Crisis, a pandemic, and two bear markets — and still come out ahead of the majority of actively managed funds. The passive case is not a straw man. It is the empirical reality that active management has to beat, after fees, consistently, and on a risk-adjusted basis.
+
+This document addresses a single question: is there a systematic, rules-based active strategy applied to the eleven SPDR sector ETFs that justifies its cost over simply holding SPY? The answer this document pursues is not "yes by construction" — it is "yes under specific, identifiable market conditions, and no when those conditions break down." That distinction matters. Overclaiming is the most common failure mode in quantitative finance, and the most damaging to an investor who acts on it.
+
+## Markets as Ecosystems, Not Machines
+
+The central intuition behind this strategy is ecological rather than mechanical. A machine has a fixed input-output relationship — the same lever always produces the same result. An ecosystem is different: it has regimes. A forest in spring behaves differently from the same forest in drought. The species relationships, the energy flows, the feedback loops all shift. Attempting to apply the optimal spring strategy during a drought destroys value.
+
+Financial markets share this character. The relationship between sector returns is not fixed. During expansions, cyclical sectors — technology, consumer discretionary, industrials — attract capital as investors reach for growth. During contractions, defensive sectors — utilities, consumer staples, real estate — hold value as investors seek yield and stability. During genuine crises, correlations collapse toward one and the distinction between sectors temporarily disappears. These are not random fluctuations around a stable mean; they are qualitatively different states of the system, each with its own internal logic.
+
+A strategy that treats all market environments identically will be right on average and disastrously wrong in the tails. A strategy that can identify which regime is currently active, and adjust accordingly, has a structural advantage — provided the regime identification is reliable, timely, and not already priced in by the time the strategy acts.
+
+## The Investment Mandate
+
+This strategy operates as a fully active fund manager with three states:
+
+**Growth regime:** The strategy takes long positions in sector ETFs assigned to the Growth cluster by the k-means regime detection model. These ETFs are weighted by inverse volatility — lower-volatility sectors receive proportionally larger allocations, stabilising the portfolio's risk contribution across holdings.
+
+**Defensive regime:** The strategy takes short positions in sector ETFs assigned to the Defensive cluster. Short positions are expressed as negative inverse-volatility weights. The thesis is that Defensive sectors underperform when the Growth regime is active, and the strategy should capture this underperformance rather than simply avoiding it.
+
+**Neutral regime:** The strategy holds cash. No sector ETFs are held long or short. This is not a failure mode — it is a deliberate design choice that acknowledges the model's uncertainty during regime transitions.
+
+The strategy rebalances at the end of every calendar month. Intra-month exits are triggered only by a statistical signal from the Kalman filter, described in Section 4. No discretionary overrides exist; every position is determined by a rule that could be specified before the fact and verified after it.
+
+## Why This Combination of Tools
+
+Two components drive the strategy's potential edge, and they operate at different frequencies.
+
+The k-means clustering model identifies the **regime** — the coarse-grained state of the market — at monthly frequency. It does this by grouping the eleven sector ETFs into clusters based on their recent return, volatility, Sharpe ratio, and momentum characteristics. The cluster structure is not imposed; it emerges from the data and is validated by silhouette analysis and sub-period stability tests. The regime label tells the strategy which direction to trade.
+
+The Kalman filter operates at **daily frequency** and solves a different problem: distinguishing genuine signal from noise in technical indicators. Raw RSI, MACD, rate-of-change, and Bollinger Band readings are contaminated by microstructure noise that carries no predictive information. The Kalman filter estimates the latent true state of each indicator, and its first difference — the delta — provides a momentum signal that is less prone to false triggers than the raw indicator. Critically, the filter also produces a state covariance $P_t$ that measures its own uncertainty, which is used to scale the entry threshold adaptively. When the filter is uncertain, it requires stronger evidence to enter. When it is confident, it allows entry on smaller movements.
+
+Together, the two components address a core challenge in systematic trading: the regime tells you what to do, and the filter tells you when the evidence is strong enough to do it.
+
+## What This Document Demonstrates
+
+The document is organised to build the case for this strategy incrementally, section by section, before delivering an honest verdict in Section 10.
+
+Section 2 presents the full decision logic as a visual flowchart and written rules before any code is shown — a commitment to explaining the strategy in plain terms before implementing it. Section 3 pulls all data via API. Sections 4 and 5 construct the features and the clustering model, with explicit validation of cluster quality and stability. Section 6 assembles the entry and exit signals. Section 7 states every trading rule formally in mathematical notation. Sections 8 and 9 run the backtest on the training period and the out-of-sample test period respectively, reporting the same set of performance metrics for both. Section 10 returns to this opening question — honestly, including the failure modes and the conditions under which the strategy should not be used.
+
+The benchmark throughout is SPY. It is never traded, never assigned a cluster label, and never gamed. It is the standard against which every performance claim is measured.
 
 ---
 
 # 2. Mental Model {#sec-mental-model}
 
-<!-- ─────────────────────────────────────────────────────────────────────────
-     SECTION 2: MENTAL MODEL
-     Goal: Give the reader a single, clear visual of the full decision logic
-           before any code or math is introduced.
-     Content to write:
-       • Mermaid flowchart covering the full pipeline:
-           Data → Feature Engineering → Kalman Filter → Clustering →
-           Regime Label → Entry Signal (delta + adaptive theta) →
-           Exit Signals (innovation z-score OR cluster flip) →
-           Portfolio Construction → Performance Evaluation
-       • Symmetric long/short structure must be visible in the diagram
-       • All entry and exit conditions clearly labelled on diagram edges
-       • Written plain-English decision rules below the diagram
-         (no math yet — that is Section 7)
-     ──────────────────────────────────────────────────────────────────────── -->
+The diagram below shows the complete decision pipeline from raw price data to final portfolio position. Every arrow represents a conditional rule; every node represents a transformation or decision point. The symmetric long/short structure is visible in the centre branch.
 
-<!-- TODO: Insert Mermaid flowchart block -->
+```{mermaid}
+%%| fig-width: 9
+flowchart TD
+    A([Daily Price Data\nSPY + 11 Sector ETFs]) --> B[Feature Engineering\nRSI · MACD · ROC · Bollinger %B\nRolling Return · Vol · Sharpe]
 
-<!-- TODO: Write plain-English decision rules below diagram -->
+    B --> C[Kalman Filter\nper ETF × per Indicator\nEstimate W and V on training only]
+
+    C --> D[Filtered State x̂_t\nState Covariance P_t\nInnovation v_t]
+
+    D --> E[Delta Signal\nδ_t = x̂_t − x̂_t-1]
+    D --> F[Innovation Z-Score\nz_t = rolling z-score of v_t]
+
+    E --> G[Monthly K-Means Clustering\nk = 3  ·  tidymodels workflow\nFeatures scaled on training only]
+
+    G --> H{Regime Label\nat rebal date τ}
+
+    H -->|Growth| I[Entry Check\nδ_t > +θ_adaptive ?]
+    H -->|Neutral| J[FLAT\nHold Cash]
+    H -->|Defensive| K[Entry Check\nδ_t < −θ_adaptive ?]
+
+    I -->|Yes| L[LONG\nInverse Vol Weighted\n+w_i]
+    I -->|No| J
+    K -->|Yes| M[SHORT\nInverse Vol Weighted\n−w_i]
+    K -->|No| J
+
+    L --> N{Exit Check\nDaily}
+    M --> N
+
+    F --> N
+    N -->|z_t > 2 | O[EXIT\nInnovation Spike\nRegime Break Signal]
+    N -->|Cluster flips\nat month end| O
+    N -->|No exit| P[Hold Position\nuntil next rebal]
+
+    O --> Q([Portfolio NAV\nMonthly Rebalance\nlubridate::rollback])
+    P --> Q
+    J --> Q
+
+    Q --> R[Performance vs SPY\nSharpe · MaxDD · Info Ratio]
+
+    style A fill:#e0f2fe,stroke:#0284c7
+    style J fill:#fef9c3,stroke:#ca8a04
+    style L fill:#dcfce7,stroke:#16a34a
+    style M fill:#fee2e2,stroke:#dc2626
+    style O fill:#fed7aa,stroke:#ea580c
+    style R fill:#f3e8ff,stroke:#9333ea
+    style Q fill:#e0f2fe,stroke:#0284c7
+```
+
+**Reading the diagram.** Data enters at the top. Every ETF gets its own Kalman filter — parameters fit once on training data, never touched again. At each month-end rebalancing date the clustering model assigns a regime label. The label sets the allowed direction: Growth permits long entries, Defensive permits short entries, Neutral forces cash. Within the permitted direction, the delta signal must also clear the adaptive threshold before a position is opened. Once open, the position is monitored daily for an innovation z-score spike (primary exit) and monthly for a cluster flip (secondary exit). Either trigger independently closes the position. Weights are inverse-volatility within each book — long weights sum to +1, short weights sum to −1.
 
 ---
 
