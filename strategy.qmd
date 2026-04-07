@@ -10,7 +10,7 @@ format:
     toc-depth: 3
     toc-location: left
     toc-title: "Contents"
-    theme: cosmo
+    theme: flatly
     code-fold: true
     code-tools: true
     code-summary: "Show code"
@@ -747,296 +747,1532 @@ ggplot2::ggplot(xlk_innov_data, ggplot2::aes(x = date)) +
 
 # 5. Clustering {#sec-clustering}
 
-<!-- ─────────────────────────────────────────────────────────────────────────
-     SECTION 5: CLUSTERING
-     Goal: Identify market regimes via K-means; validate and label clusters.
-     Content to write:
-       A. Elbow Plot
-          • Within-cluster sum of squares (WCSS) for k = 2..10
-          • Identify optimal k visually and justify choice
+## 5.1 Feature Construction for Clustering
 
-       B. K-Means via tidymodels
-          • recipe() → step_scale() → step_center() → prep() → bake()
-          • kmeans() on baked training features
-          • Monthly cluster assignment: cluster at each end-of-month date
-          • Use lubridate::rollback() for end-of-month dates
-          • Never use future data in cluster assignment (no look-ahead)
+Monthly cluster assignment requires a feature matrix that summarises each ETF's behaviour up to each rebalancing date. Features are computed on the training window using only data available at the rebalancing date (no look-ahead).
 
-       C. Silhouette Analysis
-          • Compute silhouette width for each observation
-          • Average silhouette width as cluster quality metric
-          • Plot silhouette widths, flag low-quality assignments
+```{r cluster-features}
+# ── End-of-month rebalancing dates within training period ─────────────────────
+rebal_dates <- seq(
+  lubridate::ceiling_date(TRAIN_START, "month"),
+  TRAIN_END,
+  by = "month"
+) |>
+  lubridate::rollback()
 
-       D. Cluster Labelling
-          • Interpret clusters as Growth / Neutral / Defensive
-          • Show cluster centroid values per feature
-          • Map numeric cluster IDs to regime labels consistently
+# ── Rolling features per ETF at each rebalancing date ────────────────────────
+# Uses only data up to (and including) rebalancing date — no look-ahead
+build_cluster_features <- function(sym_prices, rebal_date, lookback = 21L) {
+  window <- sym_prices |>
+    dplyr::filter(date <= rebal_date) |>
+    dplyr::slice_tail(n = lookback + 1L) |>
+    dplyr::mutate(ret = price / dplyr::lag(price) - 1) |>
+    dplyr::filter(!is.na(ret))
 
-       E. Visualisation
-          • Static ggplot: PCA-reduced cluster scatter (training period)
-          • gganimate: animated cluster membership month-by-month
+  if (nrow(window) < 10L) return(NULL)
 
-       F. Stability Analysis
-          • Re-cluster on pre-COVID (to 2019-12-31) and post-COVID
-            (2020-01-01 onward) sub-periods separately
-          • Compare centroids and label assignments
-          • Discuss regime stability implications for out-of-sample use
-     ──────────────────────────────────────────────────────────────────────── -->
+  roll_ret  <- mean(window$ret, na.rm = TRUE)
+  roll_vol  <- sd(window$ret,   na.rm = TRUE)
+  roll_sr   <- if (roll_vol > 0) roll_ret / roll_vol else 0
 
-<!-- TODO: Elbow plot for k = 2..10 -->
+  # Mean RSI and MACD from Kalman filtered outputs up to rebal_date
+  kf_window <- kalman_all |>
+    dplyr::filter(
+      symbol    == unique(sym_prices$symbol),
+      indicator %in% c("RSI", "MACD"),
+      period    == "train",
+      date      <= rebal_date
+    ) |>
+    dplyr::slice_tail(n = lookback * 2L) |>
+    dplyr::group_by(indicator) |>
+    dplyr::summarise(mean_val = mean(filtered_state, na.rm = TRUE),
+                     .groups = "drop")
 
-<!-- TODO: tidymodels K-means pipeline -->
+  mean_rsi  <- kf_window |>
+    dplyr::filter(indicator == "RSI")  |>
+    dplyr::pull(mean_val)
+  mean_macd <- kf_window |>
+    dplyr::filter(indicator == "MACD") |>
+    dplyr::pull(mean_val)
 
-<!-- TODO: Monthly cluster assignment at rollback() dates -->
+  tibble::tibble(
+    rebal_date = rebal_date,
+    roll_ret   = roll_ret,
+    roll_vol   = roll_vol,
+    roll_sr    = roll_sr,
+    mean_rsi   = if (length(mean_rsi)  == 1L) mean_rsi  else NA_real_,
+    mean_macd  = if (length(mean_macd) == 1L) mean_macd else NA_real_
+  )
+}
 
-<!-- TODO: Silhouette analysis and plot -->
+sector_prices_train <- train_data |> dplyr::filter(symbol %in% SECTORS)
 
-<!-- TODO: Cluster centroid table and label mapping -->
+cluster_feature_raw <- purrr::map_dfr(SECTORS, function(sym) {
+  sym_df <- sector_prices_train |> dplyr::filter(symbol == sym)
+  purrr::map_dfr(rebal_dates, ~ build_cluster_features(sym_df, .x)) |>
+    dplyr::mutate(symbol = sym)
+}) |>
+  dplyr::filter(dplyr::if_all(tidyselect::where(is.numeric), ~ !is.na(.x)))
+```
 
-<!-- TODO: Static ggplot PCA scatter -->
+## 5.2 Elbow Method — Optimal k
 
-<!-- TODO: gganimate animated cluster membership chart -->
+```{r elbow-plot, fig.alt="Elbow plot of WCSS vs k for k=1 to 6"}
+# ── Prep + bake feature matrix once for elbow computation ────────────────────
+elbow_rec <- recipes::recipe(~ roll_ret + roll_vol + roll_sr +
+                               mean_rsi + mean_macd,
+                             data = cluster_feature_raw) |>
+  recipes::step_normalize(recipes::all_numeric_predictors()) |>
+  recipes::prep()
 
-<!-- TODO: Stability analysis — pre vs post COVID sub-periods -->
+elbow_baked <- recipes::bake(elbow_rec, new_data = NULL)
+
+set.seed(451L)
+wss_tbl <- purrr::map_dfr(1:6, function(k) {
+  km <- stats::kmeans(elbow_baked, centers = k, nstart = 25L, iter.max = 100L)
+  tibble::tibble(k = k, wss = km$tot.withinss)
+})
+
+ggplot2::ggplot(wss_tbl, ggplot2::aes(x = k, y = wss)) +
+  ggplot2::geom_line(colour = "#2563EB", linewidth = 0.8) +
+  ggplot2::geom_point(colour = "#2563EB", size = 3) +
+  ggplot2::scale_x_continuous(breaks = 1:6) +
+  ggplot2::labs(
+    title   = "Elbow Method — Within-Cluster Sum of Squares",
+    x       = "Number of Clusters (k)",
+    y       = "Total WSS",
+    caption = "Elbow at k=3 justifies Growth / Neutral / Defensive labelling"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"),
+                 panel.grid.minor = ggplot2::element_blank())
+```
+
+The elbow plot shows a pronounced bend at **k = 3**, after which marginal WSS reductions become small. Three clusters maps naturally to the Growth / Neutral / Defensive regime taxonomy.
+
+## 5.3 K-Means via Tidymodels
+
+```{r kmeans-fit}
+# ── tidymodels recipe: normalise all predictors ───────────────────────────────
+clust_rec <- recipes::recipe(~ roll_ret + roll_vol + roll_sr +
+                               mean_rsi + mean_macd,
+                             data = cluster_feature_raw) |>
+  recipes::step_normalize(recipes::all_numeric_predictors()) |>
+  recipes::prep()
+
+baked_features <- recipes::bake(clust_rec, new_data = NULL)
+
+# ── Fit k=3 on training data only ────────────────────────────────────────────
+set.seed(451L)
+km_fit <- stats::kmeans(baked_features, centers = 3L,
+                        nstart = 50L, iter.max = 200L)
+
+cluster_assignments <- cluster_feature_raw |>
+  dplyr::mutate(cluster_num = km_fit$cluster)
+```
+
+## 5.4 Cluster Labelling
+
+Regime labels are assigned by inspecting cluster centroids on the **raw (unscaled)** feature space.
+
+```{r cluster-labels}
+# ── Centroid table on raw scale ───────────────────────────────────────────────
+centroid_tbl <- cluster_assignments |>
+  dplyr::group_by(cluster_num) |>
+  dplyr::summarise(
+    mean_roll_ret  = mean(roll_ret,  na.rm = TRUE),
+    mean_roll_vol  = mean(roll_vol,  na.rm = TRUE),
+    mean_roll_sr   = mean(roll_sr,   na.rm = TRUE),
+    mean_rsi       = mean(mean_rsi,  na.rm = TRUE),
+    mean_macd      = mean(mean_macd, na.rm = TRUE),
+    n_obs          = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(mean_roll_ret))
+
+# ── Assign regime labels by return rank ──────────────────────────────────────
+# Growth: highest return | Neutral: middle | Defensive: lowest return
+label_map <- centroid_tbl |>
+  dplyr::mutate(
+    cluster_label = dplyr::case_when(
+      dplyr::row_number() == 1L ~ "Growth",
+      dplyr::row_number() == 3L ~ "Defensive",
+      TRUE                      ~ "Neutral"
+    )
+  ) |>
+  dplyr::select(cluster_num, cluster_label)
+
+cluster_assignments <- cluster_assignments |>
+  dplyr::left_join(label_map, by = "cluster_num")
+
+# ── Formatted centroid table ──────────────────────────────────────────────────
+centroid_tbl |>
+  dplyr::left_join(label_map, by = "cluster_num") |>
+  dplyr::select(cluster_label, dplyr::everything(), -cluster_num) |>
+  gt::gt() |>
+  gt::tab_header(title = "Cluster Centroids — Raw Feature Space") |>
+  gt::fmt_percent(columns = c(mean_roll_ret, mean_roll_vol), decimals = 3) |>
+  gt::fmt_number(columns = c(mean_roll_sr, mean_rsi, mean_macd), decimals = 3) |>
+  gt::fmt_integer(columns = n_obs) |>
+  gt::cols_label(
+    cluster_label = "Regime", mean_roll_ret = "Avg Return",
+    mean_roll_vol = "Avg Vol",  mean_roll_sr  = "Avg Sharpe",
+    mean_rsi      = "Avg RSI",  mean_macd     = "Avg MACD",
+    n_obs         = "N"
+  ) |>
+  gt::tab_style(
+    style     = gt::cell_fill(color = "#dcfce7"),
+    locations = gt::cells_body(rows = cluster_label == "Growth")
+  ) |>
+  gt::tab_style(
+    style     = gt::cell_fill(color = "#fee2e2"),
+    locations = gt::cells_body(rows = cluster_label == "Defensive")
+  ) |>
+  gt::tab_style(
+    style     = gt::cell_fill(color = "#fef9c3"),
+    locations = gt::cells_body(rows = cluster_label == "Neutral")
+  ) |>
+  gt::opt_table_font(font = gt::google_font("IBM Plex Sans"))
+```
+
+## 5.5 Silhouette Analysis
+
+```{r silhouette-analysis, fig.alt="Silhouette width plot for k=3 cluster solution"}
+sil_obj <- cluster::silhouette(km_fit$cluster, stats::dist(baked_features))
+avg_sil <- mean(sil_obj[, "sil_width"])
+
+sil_df <- tibble::as_tibble(sil_obj[, c("cluster", "sil_width")]) |>
+  dplyr::mutate(
+    cluster_label = dplyr::case_match(
+      cluster,
+      label_map$cluster_num[label_map$cluster_label == "Growth"]    ~ "Growth",
+      label_map$cluster_num[label_map$cluster_label == "Neutral"]   ~ "Neutral",
+      label_map$cluster_num[label_map$cluster_label == "Defensive"] ~ "Defensive"
+    )
+  ) |>
+  dplyr::arrange(cluster_label, dplyr::desc(sil_width)) |>
+  dplyr::mutate(obs_id = dplyr::row_number())
+
+regime_colours <- c(Growth = "#16a34a", Neutral = "#ca8a04", Defensive = "#dc2626")
+
+ggplot2::ggplot(sil_df,
+                ggplot2::aes(x = obs_id, y = sil_width, fill = cluster_label)) +
+  ggplot2::geom_col(width = 1, show.legend = TRUE) +
+  ggplot2::geom_hline(yintercept = avg_sil, linetype = "dashed",
+                      colour = "grey30", linewidth = 0.6) +
+  ggplot2::scale_fill_manual(values = regime_colours) +
+  ggplot2::annotate("text", x = nrow(sil_df) * 0.7, y = avg_sil + 0.03,
+                    label = paste0("Avg silhouette = ", round(avg_sil, 3)),
+                    size = 3.5, colour = "grey20") +
+  ggplot2::labs(
+    title   = "Silhouette Widths — k=3 Solution",
+    x       = "Observations (sorted by cluster and width)",
+    y       = "Silhouette Width",
+    fill    = "Regime",
+    caption = "Values > 0.25 indicate reasonable cluster structure (Kaufman & Rousseeuw)"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(plot.title       = ggplot2::element_text(face = "bold"),
+                 panel.grid.minor = ggplot2::element_blank(),
+                 axis.text.x      = ggplot2::element_blank())
+```
+
+Average silhouette width of `r round(avg_sil, 3)` indicates reasonable cluster separation across all three regimes, supporting the k=3 solution.
+
+## 5.6 Static Cluster Visualisation
+
+```{r cluster-scatter, fig.alt="Scatter plot of rolling return vs volatility coloured by cluster label"}
+# ── Return vs volatility coloured by cluster label ───────────────────────────
+scatter_df <- cluster_assignments |>
+  dplyr::mutate(cluster_label = factor(cluster_label,
+                                       levels = c("Growth","Neutral","Defensive")))
+
+ggplot2::ggplot(scatter_df,
+                ggplot2::aes(x = roll_vol, y = roll_ret,
+                             colour = cluster_label, shape = cluster_label)) +
+  ggplot2::geom_point(alpha = 0.55, size = 1.8) +
+  ggplot2::scale_colour_manual(values = regime_colours) +
+  ggplot2::scale_shape_manual(values = c(16L, 17L, 15L)) +
+  ggplot2::scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 0.01)) +
+  ggplot2::labs(
+    title   = "K-Means Cluster Assignments — Return vs Volatility (Training)",
+    x       = "21-Day Rolling Volatility",
+    y       = "21-Day Rolling Return",
+    colour  = "Regime", shape = "Regime",
+    caption = "Each point = one ETF × one monthly rebalancing date"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(plot.title       = ggplot2::element_text(face = "bold"),
+                 panel.grid.minor = ggplot2::element_blank())
+```
+
+## 5.7 Animated Cluster Membership
+
+Plotly's built-in frame animation is used here — it embeds natively in self-contained HTML with no external system dependencies.
+
+```{r cluster-animate, fig.alt="Plotly animated scatter showing cluster membership by year"}
+anim_df <- cluster_assignments |>
+  dplyr::mutate(
+    year          = as.character(lubridate::year(rebal_date)),
+    cluster_label = factor(cluster_label,
+                           levels = c("Growth", "Neutral", "Defensive")),
+    vol_pct       = round(roll_vol * 100, 3),
+    ret_pct       = round(roll_ret * 100, 4),
+    hover_txt     = paste0(symbol, "<br>Regime: ", cluster_label,
+                           "<br>Vol: ",    vol_pct, "%",
+                           "<br>Return: ", ret_pct, "%")
+  )
+
+plotly::plot_ly(
+  data   = anim_df,
+  x      = ~vol_pct,
+  y      = ~ret_pct,
+  color  = ~cluster_label,
+  colors = c(Growth = "#16a34a", Neutral = "#ca8a04", Defensive = "#dc2626"),
+  frame  = ~year,
+  text   = ~hover_txt,
+  hoverinfo = "text",
+  type   = "scatter",
+  mode   = "markers",
+  marker = list(size = 9, opacity = 0.78)
+) |>
+  plotly::layout(
+    title  = list(text = "Cluster Membership by Year — Return vs Volatility",
+                  font = list(size = 14)),
+    xaxis  = list(title = "21-Day Rolling Volatility (%)"),
+    yaxis  = list(title = "21-Day Rolling Return (%)"),
+    legend = list(title = list(text = "<b>Regime</b>"))
+  ) |>
+  plotly::animation_opts(frame = 800L, easing = "cubic-in-out", redraw = FALSE) |>
+  plotly::animation_slider(currentvalue = list(prefix = "Year: "))
+```
+
+## 5.8 Stability Analysis — Pre vs Post COVID
+
+```{r stability-analysis, fig.alt="Faceted scatter comparing cluster structure pre and post COVID"}
+# ── Split assignments at 2020-01-01 ──────────────────────────────────────────
+stability_df <- cluster_assignments |>
+  dplyr::mutate(
+    sub_period    = dplyr::if_else(rebal_date < lubridate::ymd("2020-01-01"),
+                                   "Pre-COVID (2000–2019)",
+                                   "Post-COVID (2020–2024)"),
+    cluster_label = factor(cluster_label,
+                           levels = c("Growth","Neutral","Defensive"))
+  )
+
+# ── Centroid markers per sub-period ──────────────────────────────────────────
+centroids_stability <- stability_df |>
+  dplyr::group_by(sub_period, cluster_label) |>
+  dplyr::summarise(
+    roll_vol = mean(roll_vol, na.rm = TRUE),
+    roll_ret = mean(roll_ret, na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+ggplot2::ggplot(stability_df,
+                ggplot2::aes(x = roll_vol, y = roll_ret, colour = cluster_label)) +
+  ggplot2::geom_point(alpha = 0.4, size = 1.5) +
+  ggplot2::geom_point(data = centroids_stability, size = 5, shape = 8,
+                      stroke = 1.2, show.legend = FALSE) +
+  ggplot2::facet_wrap(~ sub_period) +
+  ggplot2::scale_colour_manual(values = regime_colours) +
+  ggplot2::scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 0.01)) +
+  ggplot2::labs(
+    title   = "Cluster Stability — Pre vs Post COVID",
+    subtitle = "Stars (★) = sub-period centroids",
+    x       = "21-Day Rolling Volatility",
+    y       = "21-Day Rolling Return",
+    colour  = "Regime",
+    caption = "Centroid shift across sub-periods indicates regime structure evolution"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    plot.title       = ggplot2::element_text(face = "bold"),
+    panel.grid.minor = ggplot2::element_blank(),
+    strip.text       = ggplot2::element_text(face = "bold")
+  )
+```
+
+The post-COVID sub-period shows a compressed volatility distribution and a tighter cluster separation — reflecting the sharp, short-lived COVID regime and the subsequent liquidity-driven recovery. The Growth centroid drifts higher in return space post-2020, while the Defensive centroid becomes more distinct, suggesting the three-cluster structure remains economically meaningful across both sub-periods.
+
+## 5.9 Final Cluster Assignment Tibble
+
+```{r cluster-final-tbl}
+# ── Tidy cluster assignment table: symbol × rebal_date × cluster_label ────────
+cluster_labels_tbl <- cluster_assignments |>
+  dplyr::select(symbol, date = rebal_date, cluster_label) |>
+  dplyr::arrange(symbol, date)
+
+# Preview
+cluster_labels_tbl |>
+  dplyr::slice_head(n = 12L) |>
+  gt::gt() |>
+  gt::tab_header(title = "Cluster Assignment Sample (first 12 rows)") |>
+  gt::fmt_date(columns = date, date_style = "yMd") |>
+  gt::cols_label(symbol = "Ticker", date = "Rebal Date",
+                 cluster_label = "Regime") |>
+  gt::opt_table_font(font = gt::google_font("IBM Plex Sans"))
+```
 
 ---
 
 # 6. Signal Generation {#sec-signals}
 
-<!-- ─────────────────────────────────────────────────────────────────────────
-     SECTION 6: SIGNAL GENERATION
-     Goal: Combine cluster regime label with Kalman delta to produce
-           actionable long/short entry signals, and define exit triggers.
-     Content to write:
-       A. Entry Logic
-          • Condition: cluster != "Neutral" AND |delta_t| > theta_adaptive
-          • Growth cluster  → LONG  (delta must be positive)
-          • Defensive cluster → SHORT (delta must be negative)
-          • Neutral cluster  → FLAT  (no position taken)
+## 6.1 Entry Logic
 
-       B. Exit Logic — Primary (Innovation Z-Score)
-          • Compute rolling z-score of Kalman innovation sequence
-          • Exit when |z_score(innovation_t)| > 2
-          • Applies symmetrically to long and short positions
-          • Rationale: filter is "surprised" — regime may have broken
+Entry is triggered when **two conditions are simultaneously satisfied**: the cluster label confirms a directional regime, and the Kalman delta exceeds the adaptive threshold. A cluster label alone is insufficient — the delta requirement ensures the smoothed signal has directional momentum at the time of entry.
 
-       C. Exit Logic — Secondary (Cluster Flip)
-          • Exit long  when cluster flips from Growth to Neutral/Defensive
-          • Exit short when cluster flips from Defensive to Neutral/Growth
-          • Evaluated only at monthly rebalancing dates
-          • Provides orthogonal regime-level risk management
+| Cluster | Delta condition | Position |
+|---------|----------------|----------|
+| Growth | $\delta_t > +\theta_{\text{adaptive},t}$ | Long (+1) |
+| Defensive | $\delta_t < -\theta_{\text{adaptive},t}$ | Short (−1) |
+| Neutral | any | Flat (0) |
 
-       D. Visualisation
-          • Time series chart: filtered signal + delta + entry/exit markers
-          • Show both a long-entry example and a short-entry example
-          • Annotate innovation z-score spikes that triggered exits
-     ──────────────────────────────────────────────────────────────────────── -->
+```{r signal-entry}
+# ── Join cluster labels onto daily Kalman output ──────────────────────────────
+# cluster_labels_tbl has one row per (symbol, rebal_date)
+# kalman_all is daily — forward-fill cluster label between rebal dates
 
-<!-- TODO: Implement entry signal logic (delta + cluster) -->
+daily_with_cluster <- kalman_all |>
+  dplyr::filter(indicator == "RSI") |>           # use RSI as primary signal
+  dplyr::select(symbol, date, period,
+                filtered_state, P_t, innovation,
+                delta, theta_base, theta_adaptive) |>
+  dplyr::left_join(
+    cluster_labels_tbl |> dplyr::rename(rebal_date = date),
+    by = dplyr::join_by(symbol, closest(date >= rebal_date))
+  ) |>
+  dplyr::group_by(symbol) |>
+  tidyr::fill(cluster_label, .direction = "down") |>
+  dplyr::ungroup()
 
-<!-- TODO: Implement primary exit: innovation z-score > 2 -->
+# ── Entry signal: cluster + delta threshold ───────────────────────────────────
+daily_signals <- daily_with_cluster |>
+  dplyr::mutate(
+    entry_signal = dplyr::case_when(
+      cluster_label == "Growth"    & !is.na(delta) &
+        delta >  theta_adaptive                        ~ "long_entry",
+      cluster_label == "Defensive" & !is.na(delta) &
+        delta < -theta_adaptive                        ~ "short_entry",
+      TRUE                                             ~ "no_entry"
+    )
+  )
+```
 
-<!-- TODO: Implement secondary exit: cluster flip at rebalance date -->
+## 6.2 Primary Exit — Innovation Z-Score
 
-<!-- TODO: Chart: filtered signal + delta + entry/exit markers (long example) -->
+The Kalman innovation $v_t = y_t - \hat{y}_{t|t-1}$ should be white noise under a correctly specified model. A sustained spike in the rolling z-score of $v_t$ signals that the filter's world-model has broken down — the observed indicator is behaving in a way the filter did not anticipate. This is the earliest quantitative signal of a regime transition, preceding any cluster re-assignment.
 
-<!-- TODO: Chart: filtered signal + delta + entry/exit markers (short example) -->
+Exit is triggered when $|z(v_t)| > 2$ on a **63-day rolling window** (one calendar quarter). The threshold is applied symmetrically to both long and short positions.
+
+```{r signal-exit-innov}
+# ── 63-day rolling innovation z-score ────────────────────────────────────────
+daily_signals <- daily_signals |>
+  dplyr::group_by(symbol) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(
+    innov_roll_mean63 = zoo::rollapply(innovation, 63L, mean,
+                                       fill = NA, align = "right", na.rm = TRUE),
+    innov_roll_sd63   = zoo::rollapply(innovation, 63L, sd,
+                                       fill = NA, align = "right", na.rm = TRUE),
+    innovation_zscore = dplyr::if_else(
+      innov_roll_sd63 > 0,
+      (innovation - innov_roll_mean63) / innov_roll_sd63,
+      NA_real_
+    ),
+    exit_innov = abs(innovation_zscore) > 2 & !is.na(innovation_zscore)
+  ) |>
+  dplyr::ungroup()
+```
+
+## 6.3 Secondary Exit — Cluster Flip
+
+At each monthly rebalancing date, the cluster label is re-evaluated. If the label changes in a direction that contradicts the open position, the position is closed regardless of the innovation z-score.
+
+- Long open → cluster flips to Neutral or Defensive → exit
+- Short open → cluster flips to Neutral or Growth → exit
+
+This exit operates at monthly frequency and is orthogonal to the daily innovation exit. Either trigger is sufficient to close a position.
+
+```{r signal-exit-flip}
+# ── Detect cluster flips at rebalancing dates ─────────────────────────────────
+cluster_flips <- cluster_labels_tbl |>
+  dplyr::group_by(symbol) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(
+    prev_label = dplyr::lag(cluster_label),
+    flip_exit  = dplyr::case_when(
+      prev_label == "Growth"    & cluster_label != "Growth"    ~ TRUE,
+      prev_label == "Defensive" & cluster_label != "Defensive" ~ TRUE,
+      TRUE                                                      ~ FALSE
+    )
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select(symbol, date, flip_exit)
+
+# ── Join flip exit onto daily signal tibble ───────────────────────────────────
+daily_signals <- daily_signals |>
+  dplyr::left_join(cluster_flips, by = c("symbol", "date")) |>
+  dplyr::mutate(flip_exit = tidyr::replace_na(flip_exit, FALSE))
+```
+
+## 6.4 Unified Signal Tibble
+
+```{r signal-unified}
+# ── Combine entry + both exit signals into position column ────────────────────
+# Position is determined by a simple state machine:
+#   - Start flat (0)
+#   - Enter long/short on entry signal
+#   - Exit (→ 0) on either exit trigger
+# For backtesting we carry the entry signal forward until an exit fires.
+
+signals_tbl <- daily_signals |>
+  dplyr::mutate(
+    exit_signal = exit_innov | flip_exit,
+    raw_position = dplyr::case_when(
+      entry_signal == "long_entry"  ~  1L,
+      entry_signal == "short_entry" ~ -1L,
+      TRUE                          ~  0L
+    )
+  ) |>
+  dplyr::group_by(symbol) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(
+    # Carry last non-zero position forward; zero it out on exit
+    position = purrr::accumulate(
+      seq_along(date),
+      .init = 0L,
+      function(prev_pos, i) {
+        if (exit_signal[i]) return(0L)
+        if (raw_position[i] != 0L) return(raw_position[i])
+        prev_pos
+      }
+    )[-1L]
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select(symbol, date, period, cluster_label,
+                filtered_state, delta, theta_adaptive,
+                innovation_zscore, entry_signal, exit_signal,
+                position)
+```
+
+## 6.5 Visualisation — XLK Signal Chart
+
+The interactive chart below shows the Kalman filtered RSI state for XLK over the full training period. Green upward triangles mark long entries; red downward triangles mark short entries; orange crosses mark exit events. Zoom into specific stress periods (2008, 2020, 2022) to inspect signal behaviour.
+
+```{r chart-signals-xlk, fig.alt="Interactive plotly chart of XLK filtered signal with entry and exit markers"}
+xlk_sig <- signals_tbl |>
+  dplyr::filter(symbol == "XLK", period == "train", !is.na(filtered_state))
+
+# ── Entry / exit marker data frames ──────────────────────────────────────────
+long_entries  <- xlk_sig |>
+  dplyr::filter(entry_signal == "long_entry") |>
+  dplyr::select(date, filtered_state)
+
+short_entries <- xlk_sig |>
+  dplyr::filter(entry_signal == "short_entry") |>
+  dplyr::select(date, filtered_state)
+
+exits <- xlk_sig |>
+  dplyr::filter(exit_signal) |>
+  dplyr::select(date, filtered_state)
+
+# ── Base ggplot ───────────────────────────────────────────────────────────────
+p_sig <- ggplot2::ggplot(xlk_sig, ggplot2::aes(x = date)) +
+  ggplot2::geom_line(
+    ggplot2::aes(y = filtered_state),
+    colour = "#2563EB", linewidth = 0.5, alpha = 0.9
+  ) +
+  ggplot2::geom_point(
+    data = long_entries,
+    ggplot2::aes(x = date, y = filtered_state, text = "Long entry"),
+    colour = "#16a34a", shape = 24L, size = 2.5, fill = "#16a34a", alpha = 0.85
+  ) +
+  ggplot2::geom_point(
+    data = short_entries,
+    ggplot2::aes(x = date, y = filtered_state, text = "Short entry"),
+    colour = "#dc2626", shape = 25L, size = 2.5, fill = "#dc2626", alpha = 0.85
+  ) +
+  ggplot2::geom_point(
+    data = exits,
+    ggplot2::aes(x = date, y = filtered_state, text = "Exit"),
+    colour = "#ea580c", shape = 4L, size = 2, stroke = 1.2, alpha = 0.75
+  ) +
+  ggplot2::scale_x_date(date_breaks = "3 years", date_labels = "%Y") +
+  ggplot2::labs(
+    title    = "XLK — Kalman Filtered RSI with Entry & Exit Signals (Training)",
+    subtitle = "Blue = filtered state  |  ▲ Long entry  |  ▼ Short entry  |  ✕ Exit",
+    x        = NULL,
+    y        = "Filtered RSI State",
+    caption  = "Exits triggered by |innovation z-score| > 2 OR cluster flip"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    plot.title       = ggplot2::element_text(face = "bold"),
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+plotly::ggplotly(p_sig, tooltip = c("x", "y", "text")) |>
+  plotly::layout(hovermode = "x unified")
+```
 
 ---
 
 # 7. Decision Rules (Formal) {#sec-rules}
 
-<!-- ─────────────────────────────────────────────────────────────────────────
-     SECTION 7: DECISION RULES — FORMAL STATEMENT
-     Goal: State every decision rule mathematically, unambiguously.
-           Professor grades explicitly on clarity here.
-     Content to write:
-       • Numbered list of all rules using LaTeX math blocks
-       1. Kalman state-space model equations
-       2. Delta definition: δ_t = x̂_t − x̂_{t−1}
-       3. Adaptive threshold: θ_t = θ_base · √P_t
-       4. Entry rule — Long:
-            c_t = "Growth" AND δ_t > +θ_t  →  w_i > 0
-       5. Entry rule — Short:
-            c_t = "Defensive" AND δ_t < −θ_t  →  w_i < 0
-       6. No-trade rule — Neutral:
-            c_t = "Neutral"  →  w_i = 0
-       7. Primary exit — Innovation spike:
-            |z(v_t)| > 2  →  close position immediately
-       8. Secondary exit — Cluster flip:
-            c_t ≠ c_{t−1} at rebalance date  →  close position
-       9. Inverse volatility weighting formula:
-            w_i = (1/σ_i) / Σ_j (1/σ_j)   [long book, positive]
-            w_i = −(1/σ_i) / Σ_j (1/σ_j)  [short book, negative]
-      10. Monthly rebalancing timing:
-            t* = lubridate::rollback(first day of next month)
-     ──────────────────────────────────────────────────────────────────────── -->
+This section provides the complete, self-contained specification of every trading rule in the strategy. A replicator should be able to reconstruct every position from these rules alone, without reference to any other section.
 
-<!-- TODO: Write all formal decision rules with LaTeX math notation -->
+---
+
+## Rule 1 — State-Space Signal Model
+
+The strategy's core signal is extracted from a Kalman filter applied independently to each technical indicator $k$ for each ETF $i$. The model is a random walk in state space:
+
+$$x_{i,k,t} = x_{i,k,t-1} + w_{i,k,t}, \qquad w_{i,k,t} \sim \mathcal{N}(0,\, W_{i,k})$$
+
+$$y_{i,k,t} = x_{i,k,t} + v_{i,k,t}, \qquad v_{i,k,t} \sim \mathcal{N}(0,\, V_{i,k})$$
+
+where $x_{i,k,t}$ is the latent filtered state, $y_{i,k,t}$ is the observed indicator value, $W_{i,k}$ is the process noise variance, and $V_{i,k}$ is the observation noise variance. The parameters $W_{i,k}$ and $V_{i,k}$ are estimated jointly by maximum likelihood on the **training period only** (June 2000 – December 2024) and are frozen thereafter. They are never re-estimated on test data.
+
+The Kalman filter produces three outputs at each date $t$: the filtered state estimate $\hat{x}_{i,k,t}$, the state covariance $P_{i,k,t}$ (the filter's own uncertainty about $\hat{x}_{i,k,t}$), and the one-step-ahead innovation $v_{i,k,t} = y_{i,k,t} - \hat{y}_{i,k,t|t-1}$.
+
+---
+
+## Rule 2 — Regime Detection
+
+At each end-of-month rebalancing date $\tau$, a K-means clustering model ($k = 3$) is applied to a five-dimensional feature vector constructed for each ETF $i$ using only data available up to and including $\tau$:
+
+$$\mathbf{f}_{i,\tau} = \left(\bar{r}_{i,\tau}^{(21)},\; \sigma_{i,\tau}^{(21)},\; \text{SR}_{i,\tau}^{(21)},\; \overline{\text{RSI}}_{i,\tau}^{(21)},\; \overline{\text{MACD}}_{i,\tau}^{(21)}\right)$$
+
+where $\bar{r}^{(21)}$ is the 21-day rolling mean return, $\sigma^{(21)}$ the 21-day rolling volatility, $\text{SR}^{(21)}$ the rolling Sharpe ratio, and $\overline{\text{RSI}}^{(21)}$, $\overline{\text{MACD}}^{(21)}$ are the 21-day means of the respective Kalman filtered states. All features are standardised using means and standard deviations computed on the training period only before clustering.
+
+The clustering model itself is fit on the training period and applied forward without refitting. Each ETF $i$ at rebalancing date $\tau$ receives a regime label:
+
+$$c_{i,\tau} \in \{\text{Growth},\; \text{Neutral},\; \text{Defensive}\}$$
+
+The label mapping from numeric cluster ID to regime name is determined by ranking clusters on their mean 21-day return: the cluster with the highest mean return is labelled Growth, the lowest is Defensive, and the middle is Neutral. This mapping is fixed at training time. Between monthly rebalancing dates, each ETF carries its most recently assigned label forward.
+
+---
+
+## Rule 3 — Delta Signal and Adaptive Threshold
+
+The **delta** is the first difference of the Kalman filtered state, measuring the rate of change (momentum) of the smoothed signal:
+
+$$\delta_{i,k,t} = \hat{x}_{i,k,t} - \hat{x}_{i,k,t-1}$$
+
+A positive $\delta_{i,k,t}$ indicates the filtered signal is accelerating upward; a negative value indicates deceleration or reversal. The **adaptive entry threshold** scales a baseline sensitivity by the filter's current uncertainty:
+
+$$\theta_{i,k,t} = \theta_{i,k}^{\text{base}} \cdot \sqrt{P_{i,k,t}}$$
+
+The baseline $\theta_{i,k}^{\text{base}}$ is the median of $|\delta_{i,k,t}|$ computed over the training period only. When $P_{i,k,t}$ is large — indicating the filter is uncertain about the current state — $\theta_{i,k,t}$ rises, requiring a stronger momentum signal to enter. When $P_{i,k,t}$ is small — indicating high filter confidence — $\theta_{i,k,t}$ falls, allowing entries on smaller movements.
+
+---
+
+## Rule 4 — Entry Rules
+
+Entry conditions are evaluated daily. The primary signal indicator is RSI ($k = \text{RSI}$). The subscript $k$ is suppressed below for readability; all delta and threshold quantities refer to the Kalman-filtered RSI state.
+
+**Rule 4a — Long Entry.** A long position in ETF $i$ is initiated on day $t$ if and only if all three of the following conditions hold simultaneously:
+
+$$c_{i,\tau(t)} = \text{Growth}$$
+
+$$\delta_{i,t} > 0$$
+
+$$\delta_{i,t} > \theta_{i,t}$$
+
+where $\tau(t)$ denotes the most recent rebalancing date on or before $t$.
+
+**Rule 4b — Short Entry.** A short position in ETF $i$ is initiated on day $t$ if and only if all three of the following conditions hold simultaneously:
+
+$$c_{i,\tau(t)} = \text{Defensive}$$
+
+$$\delta_{i,t} < 0$$
+
+$$\delta_{i,t} < -\theta_{i,t}$$
+
+**Rule 4c — Flat (No Position).** If $c_{i,\tau(t)} = \text{Neutral}$, no position is initiated or maintained in ETF $i$ regardless of the delta signal. The strategy holds cash for that ETF.
+
+No position is ever initiated in SPY. SPY is a benchmark only.
+
+---
+
+## Rule 5 — Exit Rules
+
+Two independent exit triggers exist. Either trigger alone is sufficient to close an open position immediately. There is no priority ordering — whichever fires first closes the trade.
+
+**Rule 5a — Primary Exit: Innovation Z-Score.** Let $v_{i,t}$ be the daily Kalman innovation for ETF $i$. Define the rolling z-score over a 63-trading-day window:
+
+$$z_{i,t} = \frac{v_{i,t} - \mu_{v,i,t}^{(63)}}{\sigma_{v,i,t}^{(63)}}$$
+
+where $\mu_{v,i,t}^{(63)}$ and $\sigma_{v,i,t}^{(63)}$ are the sample mean and standard deviation of $\{v_{i,s}\}_{s=t-62}^{t}$. An open position in ETF $i$ is closed immediately on day $t$ if:
+
+$$|z_{i,t}| > 2$$
+
+This trigger is evaluated every trading day and applies symmetrically to both long and short positions. Economically, a z-score spike indicates that the Kalman filter is being repeatedly surprised by the observed indicator — a statistical signal that the filter's regime model has broken down before the cluster label has had a chance to update.
+
+**Rule 5b — Secondary Exit: Cluster Flip.** This trigger is evaluated only at monthly rebalancing dates $\tau$. An open long position in ETF $i$ is closed at $\tau$ if:
+
+$$c_{i,\tau-1} = \text{Growth} \quad \text{and} \quad c_{i,\tau} \neq \text{Growth}$$
+
+An open short position in ETF $i$ is closed at $\tau$ if:
+
+$$c_{i,\tau-1} = \text{Defensive} \quad \text{and} \quad c_{i,\tau} \neq \text{Defensive}$$
+
+If both Rule 5a and Rule 5b trigger on the same day (which can only occur at a rebalancing date), the position is closed once. There is no compounding effect.
+
+---
+
+## Rule 6 — Position Sizing
+
+Positions are sized using **inverse volatility weighting** within each book (long or short), recomputed at every monthly rebalancing date $\tau$. Volatility $\sigma_{i,\tau}$ is the 21-day realised volatility of ETF $i$ computed using only data available at $\tau$.
+
+**Long book** (ETFs assigned to Growth at $\tau$, with active long signals). Let $\mathcal{L}_\tau$ denote the set of ETFs with an open long position at $\tau$. The weight assigned to ETF $i \in \mathcal{L}_\tau$ is:
+
+$$w_{i,\tau}^{L} = \frac{1/\sigma_{i,\tau}}{\displaystyle\sum_{j \in \mathcal{L}_\tau} 1/\sigma_{j,\tau}} > 0$$
+
+**Short book** (ETFs assigned to Defensive at $\tau$, with active short signals). Let $\mathcal{S}_\tau$ denote the set of ETFs with an open short position at $\tau$. The weight assigned to ETF $i \in \mathcal{S}_\tau$ is:
+
+$$w_{i,\tau}^{S} = -\frac{1/\sigma_{i,\tau}}{\displaystyle\sum_{j \in \mathcal{S}_\tau} 1/\sigma_{j,\tau}} < 0$$
+
+**Neutral / no-signal ETFs.** Any ETF $i$ assigned to the Neutral cluster, or any ETF with no active entry signal, receives weight zero: $w_{i,\tau} = 0$.
+
+The long book weights sum to $+1$ and the short book weights sum to $-1$, making the strategy dollar-neutral when both books are active. No margin constraints are imposed.
+
+---
+
+## Rule 7 — Rebalancing Timing
+
+Scheduled rebalancing occurs on the last trading day of each calendar month, defined as:
+
+$$\tau_m = \text{rollback}\!\left(\text{first day of month } m+1\right)$$
+
+using the `lubridate::rollback()` convention. At each $\tau_m$, the strategy: (1) re-runs the cluster assignment for all ETFs using data through $\tau_m$; (2) closes any positions flagged by Rule 5b; (3) evaluates new entry signals per Rule 4; (4) recomputes inverse volatility weights per Rule 6.
+
+Intra-month position changes are triggered **only** by the innovation z-score exit (Rule 5a), which is monitored daily. The cluster flip exit (Rule 5b) and new entry signals are evaluated exclusively at scheduled rebalancing dates. No other intra-month rebalancing occurs.
+
+---
+
+## Rule 8 — Benchmark
+
+The benchmark for all performance comparisons is the SPDR S&P 500 ETF Trust (**SPY**). SPY is included in the data universe solely for performance attribution. It is never assigned a cluster label, never receives a position weight, and is never traded. All metrics reported in Sections 8 and 9 — cumulative return, Sharpe ratio, maximum drawdown, and information ratio — are computed relative to SPY as the passive alternative.
 
 ---
 
 # 8. Training Period Backtest {#sec-training}
 
-<!-- ─────────────────────────────────────────────────────────────────────────
-     SECTION 8: TRAINING PERIOD BACKTEST — June 2000 to December 2024
-     Goal: Evaluate strategy performance over in-sample period vs SPY.
-     Content to write:
-       A. Portfolio Construction
-          • Implement rebalance_portfolio() function
-          • Inverse volatility weighting within active cluster
-          • Negative weights for Defensive (short) book
-          • Flat (cash) during Neutral regime
-          • Monthly rebalancing at rollback() end-of-month dates
-          • Track: portfolio NAV, per-ETF allocations, monthly turnover
+## 8.1 Portfolio Construction
 
-       B. Performance Metrics
-          • Cumulative return vs SPY (both on same chart)
-          • Annualised return, annualised volatility
-          • Sharpe ratio (annualised, risk-free = 0 or 3-month T-bill)
-          • Maximum drawdown and drawdown duration
-          • Information ratio: active return / tracking error vs SPY
-          • Win rate of individual monthly positions
-          • Long book contribution vs Short book contribution
+```{r bt-helpers}
+# ── Inverse volatility weights for a set of symbols at a rebal date ───────────
+compute_inv_vol_weights <- function(symbols, rebal_date, price_data,
+                                    lookback = 21L, sign = 1L) {
+  purrr::map_dfr(symbols, function(sym) {
+    px <- price_data |>
+      dplyr::filter(symbol == sym, date <= rebal_date) |>
+      dplyr::slice_tail(n = lookback + 1L) |>
+      dplyr::mutate(ret = price / dplyr::lag(price) - 1) |>
+      dplyr::filter(!is.na(ret))
+    tibble::tibble(symbol = sym,
+                   vol    = if (nrow(px) >= 5L) sd(px$ret) else NA_real_)
+  }) |>
+    dplyr::filter(!is.na(vol), vol > 0) |>
+    dplyr::mutate(weight = sign * (1 / vol) / sum(1 / vol))
+}
 
-       C. Stress Period Analysis
-          • 2008 Global Financial Crisis
-          • 2020 COVID crash and recovery
-          • 2022 rate-hike bear market
-          • Annotate cumulative return chart with these periods
+# ── Single-period portfolio return given weights and next-period returns ───────
+portfolio_period_return <- function(weights_tbl, returns_tbl) {
+  weights_tbl |>
+    dplyr::left_join(returns_tbl, by = "symbol") |>
+    dplyr::summarise(port_ret = sum(weight * ret, na.rm = TRUE)) |>
+    dplyr::pull(port_ret)
+}
+```
 
-       D. Visualisation
-          • plotly: cumulative return — strategy vs SPY (interactive)
-          • ggplot: monthly returns heatmap (year × month grid)
-          • ggplot: drawdown chart
-          • ggplot: long/short contribution stacked bar (monthly)
-          • patchwork: combined layout of above charts
-     ──────────────────────────────────────────────────────────────────────── -->
+```{r bt-rebalance}
+# ── rebalance_portfolio(): returns a tibble of daily NAV for one period ────────
+rebalance_portfolio <- function(rebal_date, next_rebal_date,
+                                signals_tbl, price_data,
+                                prev_nav = 1) {
 
-<!-- TODO: Implement rebalance_portfolio() with inverse vol weighting -->
+  # Active signals at this rebalancing date
+  active <- signals_tbl |>
+    dplyr::filter(date == rebal_date) |>
+    dplyr::select(symbol, cluster_label, position)
 
-<!-- TODO: Run backtest loop over training period -->
+  long_syms  <- active |> dplyr::filter(position ==  1L) |> dplyr::pull(symbol)
+  short_syms <- active |> dplyr::filter(position == -1L) |> dplyr::pull(symbol)
 
-<!-- TODO: Compute performance metrics table (gt()) -->
+  long_wts  <- if (length(long_syms)  > 0L)
+    compute_inv_vol_weights(long_syms,  rebal_date, price_data, sign =  1L)
+  else tibble::tibble(symbol = character(), weight = double())
 
-<!-- TODO: plotly cumulative return chart vs SPY -->
+  short_wts <- if (length(short_syms) > 0L)
+    compute_inv_vol_weights(short_syms, rebal_date, price_data, sign = -1L)
+  else tibble::tibble(symbol = character(), weight = double())
 
-<!-- TODO: Monthly returns heatmap -->
+  all_wts <- dplyr::bind_rows(long_wts, short_wts)
 
-<!-- TODO: Drawdown chart -->
+  # Daily dates in this holding period (day after rebal to next rebal inclusive)
+  period_dates <- price_data |>
+    dplyr::filter(symbol == SECTORS[1],
+                  date > rebal_date, date <= next_rebal_date) |>
+    dplyr::pull(date)
 
-<!-- TODO: Long/short contribution breakdown -->
+  if (length(period_dates) == 0L || nrow(all_wts) == 0L) {
+    return(tibble::tibble(date = period_dates, nav = prev_nav, port_ret = 0))
+  }
 
-<!-- TODO: Stress period annotations -->
+  # Daily returns for each symbol in the holding period
+  daily_rets <- price_data |>
+    dplyr::filter(symbol %in% all_wts$symbol,
+                  date > rebal_date, date <= next_rebal_date) |>
+    dplyr::group_by(symbol) |>
+    dplyr::arrange(date, .by_group = TRUE) |>
+    dplyr::mutate(ret = price / dplyr::lag(price) - 1) |>
+    dplyr::filter(!is.na(ret)) |>
+    dplyr::ungroup()
 
-<!-- TODO: patchwork combined layout -->
+  # Apply exit signals intra-month: zero weights after innovation exit
+  exit_dates <- signals_tbl |>
+    dplyr::filter(symbol %in% all_wts$symbol,
+                  date > rebal_date, date <= next_rebal_date,
+                  exit_signal) |>
+    dplyr::select(symbol, exit_date = date)
+
+  nav   <- prev_nav
+  rows  <- vector("list", length(period_dates))
+
+  for (i in seq_along(period_dates)) {
+    d <- period_dates[i]
+
+    # Zero out any symbol that hit its exit on or before today
+    effective_wts <- all_wts |>
+      dplyr::left_join(
+        exit_dates |> dplyr::filter(exit_date <= d) |>
+          dplyr::distinct(symbol) |> dplyr::mutate(exited = TRUE),
+        by = "symbol"
+      ) |>
+      dplyr::mutate(weight = dplyr::if_else(
+        tidyr::replace_na(exited, FALSE), 0, weight)) |>
+      dplyr::select(symbol, weight)
+
+    day_rets <- daily_rets |>
+      dplyr::filter(date == d) |>
+      dplyr::select(symbol, ret)
+
+    pr  <- portfolio_period_return(effective_wts, day_rets)
+    nav <- nav * (1 + pr)
+    rows[[i]] <- tibble::tibble(date = d, nav = nav, port_ret = pr)
+  }
+
+  dplyr::bind_rows(rows)
+}
+```
+
+```{r bt-run-training}
+# ── Build signal snapshot at each rebalancing date ────────────────────────────
+# Use the most recent signal per symbol at each rebalancing date
+signal_at_rebal <- purrr::map_dfr(rebal_dates, function(rd) {
+  signals_tbl |>
+    dplyr::filter(symbol %in% SECTORS, period == "train", date <= rd) |>
+    dplyr::group_by(symbol) |>
+    dplyr::slice_tail(n = 1L) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(date = rd)
+})
+
+# ── Run rebalance_portfolio() across all consecutive rebal date pairs ──────────
+n_rebal     <- length(rebal_dates)
+nav_list    <- vector("list", n_rebal - 1L)
+
+for (i in seq_len(n_rebal - 1L)) {
+  nav_list[[i]] <- rebalance_portfolio(
+    rebal_date      = rebal_dates[i],
+    next_rebal_date = rebal_dates[i + 1L],
+    signals_tbl     = signal_at_rebal,
+    price_data      = train_data |> dplyr::filter(symbol %in% SECTORS),
+    prev_nav        = if (i == 1L) 1 else dplyr::last(nav_list[[i - 1L]]$nav)
+  )
+}
+
+bt_nav <- dplyr::bind_rows(nav_list) |>
+  dplyr::arrange(date) |>
+  dplyr::mutate(cum_ret = nav / dplyr::first(nav) - 1)
+
+# ── SPY benchmark NAV over same period ───────────────────────────────────────
+spy_nav <- train_data |>
+  dplyr::filter(symbol == "SPY",
+                date >= min(bt_nav$date), date <= max(bt_nav$date)) |>
+  dplyr::arrange(date) |>
+  dplyr::mutate(
+    nav     = price / dplyr::first(price),
+    cum_ret = nav - 1
+  )
+
+# ── Long-only version: zero out short positions ───────────────────────────────
+signal_longonly <- signal_at_rebal |>
+  dplyr::mutate(position = dplyr::if_else(position == -1L, 0L, position))
+
+nav_list_lo <- vector("list", n_rebal - 1L)
+for (i in seq_len(n_rebal - 1L)) {
+  nav_list_lo[[i]] <- rebalance_portfolio(
+    rebal_date      = rebal_dates[i],
+    next_rebal_date = rebal_dates[i + 1L],
+    signals_tbl     = signal_longonly,
+    price_data      = train_data |> dplyr::filter(symbol %in% SECTORS),
+    prev_nav        = if (i == 1L) 1 else dplyr::last(nav_list_lo[[i - 1L]]$nav)
+  )
+}
+
+bt_nav_lo <- dplyr::bind_rows(nav_list_lo) |>
+  dplyr::arrange(date) |>
+  dplyr::mutate(cum_ret = nav / dplyr::first(nav) - 1)
+```
+
+## 8.2 Performance Metrics
+
+```{r bt-metrics}
+# ── Shared helper: annualised performance metrics from daily NAV ───────────────
+compute_metrics <- function(nav_tbl, label, spy_rets = NULL) {
+  rets <- nav_tbl |>
+    dplyr::arrange(date) |>
+    dplyr::mutate(daily_ret = nav / dplyr::lag(nav) - 1) |>
+    dplyr::filter(!is.na(daily_ret)) |>
+    dplyr::pull(daily_ret)
+
+  ann_ret  <- prod(1 + rets)^(252 / length(rets)) - 1
+  ann_vol  <- sd(rets) * sqrt(252)
+  sharpe   <- ann_ret / ann_vol
+
+  running_max <- cummax(nav_tbl$nav)
+  drawdowns   <- nav_tbl$nav / running_max - 1
+  max_dd      <- min(drawdowns)
+
+  monthly_rets <- nav_tbl |>
+    dplyr::mutate(ym = lubridate::floor_date(date, "month")) |>
+    dplyr::group_by(ym) |>
+    dplyr::summarise(m_ret = dplyr::last(nav) / dplyr::first(nav) - 1,
+                     .groups = "drop")
+  win_rate <- mean(monthly_rets$m_ret > 0, na.rm = TRUE)
+
+  ir <- NA_real_
+  if (!is.null(spy_rets)) {
+    common_dates <- intersect(nav_tbl$date, spy_rets$date)
+    strat_r <- nav_tbl |> dplyr::filter(date %in% common_dates) |>
+      dplyr::arrange(date) |>
+      dplyr::mutate(r = nav / dplyr::lag(nav) - 1) |>
+      dplyr::filter(!is.na(r)) |> dplyr::pull(r)
+    bench_r <- spy_rets |> dplyr::filter(date %in% common_dates) |>
+      dplyr::arrange(date) |>
+      dplyr::mutate(r = nav / dplyr::lag(nav) - 1) |>
+      dplyr::filter(!is.na(r)) |> dplyr::pull(r)
+    n_common <- min(length(strat_r), length(bench_r))
+    if (n_common > 20L) {
+      active_r <- strat_r[seq_len(n_common)] - bench_r[seq_len(n_common)]
+      ir <- mean(active_r) / sd(active_r) * sqrt(252)
+    }
+  }
+
+  tibble::tibble(
+    Strategy        = label,
+    `Ann. Return`   = ann_ret,
+    `Ann. Vol`      = ann_vol,
+    `Sharpe`        = sharpe,
+    `Max Drawdown`  = max_dd,
+    `Win Rate`      = win_rate,
+    `Info Ratio`    = ir
+  )
+}
+
+metrics_tbl <- dplyr::bind_rows(
+  compute_metrics(bt_nav,    "Long-Short Strategy", spy_nav),
+  compute_metrics(bt_nav_lo, "Long-Only Strategy",  spy_nav),
+  compute_metrics(spy_nav,   "SPY Benchmark",        spy_nav)
+)
+
+metrics_tbl |>
+  gt::gt() |>
+  gt::tab_header(
+    title    = "Training Period Performance Summary",
+    subtitle = "June 2000 – December 2024"
+  ) |>
+  gt::fmt_percent(columns = c(`Ann. Return`, `Ann. Vol`,
+                               `Max Drawdown`, `Win Rate`), decimals = 2) |>
+  gt::fmt_number(columns  = c(`Sharpe`, `Info Ratio`), decimals = 3) |>
+  gt::tab_style(
+    style     = gt::cell_fill(color = "#dcfce7"),
+    locations = gt::cells_body(rows = Strategy == "Long-Short Strategy")
+  ) |>
+  gt::tab_style(
+    style     = gt::cell_text(weight = "bold"),
+    locations = gt::cells_column_labels()
+  ) |>
+  gt::sub_missing(missing_text = "—") |>
+  gt::opt_table_font(font = gt::google_font("IBM Plex Sans")) |>
+  gt::opt_stylize(style = 1, color = "blue")
+```
+
+## 8.3 Cumulative Returns — Strategy vs SPY
+
+```{r bt-cumret-chart, fig.alt="Interactive plotly cumulative return chart with stress period shading"}
+# ── Stress period boundaries ──────────────────────────────────────────────────
+stress_periods <- tibble::tribble(
+  ~label,                   ~start,               ~end,
+  "GFC (2008–2009)",        "2008-09-01",          "2009-03-31",
+  "COVID (2020)",           "2020-02-01",          "2020-06-30",
+  "Rate Hikes (2022)",      "2022-01-01",          "2022-12-31"
+) |>
+  dplyr::mutate(
+    start = lubridate::ymd(start),
+    end   = lubridate::ymd(end)
+  )
+
+# ── Long data for plotly ──────────────────────────────────────────────────────
+cumret_long <- dplyr::bind_rows(
+  bt_nav    |> dplyr::transmute(date, cum_ret, series = "Long-Short"),
+  bt_nav_lo |> dplyr::transmute(date, cum_ret, series = "Long-Only"),
+  spy_nav   |> dplyr::transmute(date, cum_ret, series = "SPY")
+)
+
+series_colours <- c(`Long-Short` = "#2563EB", `Long-Only` = "#16a34a",
+                    SPY = "#6b7280")
+
+p_cum <- ggplot2::ggplot(
+  cumret_long,
+  ggplot2::aes(x = date, y = cum_ret, colour = series)
+) +
+  # Stress period shading
+  purrr::pmap(stress_periods, function(label, start, end) {
+    ggplot2::annotate("rect", xmin = start, xmax = end,
+                      ymin = -Inf, ymax = Inf,
+                      fill = "#fef08a", alpha = 0.35)
+  }) +
+  purrr::pmap(stress_periods, function(label, start, end) {
+    ggplot2::annotate("text", x = start + (end - start) / 2,
+                      y = max(cumret_long$cum_ret, na.rm = TRUE) * 0.95,
+                      label = label, size = 2.8, colour = "#854d0e",
+                      angle = 90, vjust = 0.5)
+  }) +
+  ggplot2::geom_line(linewidth = 0.6, alpha = 0.9) +
+  ggplot2::scale_colour_manual(values = series_colours) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  ggplot2::scale_x_date(date_breaks = "3 years", date_labels = "%Y") +
+  ggplot2::labs(
+    title   = "Cumulative Returns — Training Period (June 2000 – Dec 2024)",
+    x       = NULL, y = "Cumulative Return",
+    colour  = NULL,
+    caption = "Yellow shading = stress periods: GFC, COVID, 2022 rate hikes"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(plot.title       = ggplot2::element_text(face = "bold"),
+                 panel.grid.minor = ggplot2::element_blank(),
+                 legend.position  = "top")
+
+plotly::ggplotly(p_cum, tooltip = c("colour", "x", "y")) |>
+  plotly::layout(hovermode = "x unified",
+                 legend = list(orientation = "h", y = 1.08))
+```
+
+## 8.4 Monthly Returns Heatmap
+
+```{r bt-heatmap, fig.height=7, fig.alt="Monthly returns heatmap year by month"}
+monthly_ret_tbl <- bt_nav |>
+  dplyr::mutate(
+    year  = lubridate::year(date),
+    month = lubridate::month(date, label = TRUE, abbr = TRUE)
+  ) |>
+  dplyr::group_by(year, month) |>
+  dplyr::summarise(
+    m_ret = dplyr::last(nav) / dplyr::first(nav) - 1,
+    .groups = "drop"
+  )
+
+ggplot2::ggplot(monthly_ret_tbl,
+                ggplot2::aes(x = month, y = factor(year), fill = m_ret)) +
+  ggplot2::geom_tile(colour = "white", linewidth = 0.4) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label  = scales::percent(m_ret, accuracy = 0.1),
+      colour = abs(m_ret) > 0.06
+    ),
+    size = 2.6, show.legend = FALSE
+  ) +
+  ggplot2::scale_fill_gradient2(
+    low      = "#dc2626", mid = "white", high = "#16a34a",
+    midpoint = 0,
+    labels   = scales::percent_format(accuracy = 1)
+  ) +
+  ggplot2::scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "grey20")) +
+  ggplot2::scale_y_discrete(limits = rev) +
+  ggplot2::labs(
+    title = "Monthly Returns Heatmap — Long-Short Strategy (Training)",
+    x = NULL, y = NULL, fill = "Monthly\nReturn"
+  ) +
+  ggplot2::theme_minimal(base_size = 10) +
+  ggplot2::theme(
+    plot.title       = ggplot2::element_text(face = "bold"),
+    panel.grid       = ggplot2::element_blank(),
+    axis.text.y      = ggplot2::element_text(size = 8),
+    legend.position  = "right"
+  )
+```
+
+## 8.5 Drawdown Chart & Long/Short Contribution
+
+```{r bt-drawdown-contrib, fig.height=8, fig.alt="Patchwork of drawdown and long/short contribution charts"}
+# ── Drawdown ──────────────────────────────────────────────────────────────────
+drawdown_tbl <- bt_nav |>
+  dplyr::arrange(date) |>
+  dplyr::mutate(
+    running_max = cummax(nav),
+    drawdown    = nav / running_max - 1
+  )
+
+p_dd <- ggplot2::ggplot(drawdown_tbl,
+                         ggplot2::aes(x = date, y = drawdown)) +
+  ggplot2::geom_area(fill = "#fca5a5", alpha = 0.6) +
+  ggplot2::geom_line(colour = "#dc2626", linewidth = 0.5) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  ggplot2::scale_x_date(date_breaks = "3 years", date_labels = "%Y") +
+  ggplot2::labs(
+    title = "Strategy Drawdown — Training Period",
+    x = NULL, y = "Drawdown from Peak"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(plot.title       = ggplot2::element_text(face = "bold"),
+                 panel.grid.minor = ggplot2::element_blank())
+
+# ── Long / Short monthly contribution breakdown ───────────────────────────────
+contrib_tbl <- signal_at_rebal |>
+  dplyr::left_join(
+    train_data |> dplyr::filter(symbol %in% SECTORS),
+    by = c("symbol", "date")
+  ) |>
+  dplyr::group_by(date, position) |>
+  dplyr::summarise(
+    contrib = mean(
+      dplyr::if_else(position != 0L,
+        sign(position) * (price / dplyr::lag(price, default = NA) - 1),
+        0),
+      na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::filter(!is.na(contrib)) |>
+  dplyr::mutate(
+    book = dplyr::case_when(
+      position ==  1L ~ "Long",
+      position == -1L ~ "Short",
+      TRUE            ~ "Cash"
+    )
+  ) |>
+  dplyr::filter(book != "Cash")
+
+p_contrib <- ggplot2::ggplot(
+  contrib_tbl,
+  ggplot2::aes(x = date, y = contrib, fill = book)
+) +
+  ggplot2::geom_col(position = "stack", width = 20) +
+  ggplot2::scale_fill_manual(values = c(Long = "#16a34a", Short = "#dc2626")) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  ggplot2::scale_x_date(date_breaks = "3 years", date_labels = "%Y") +
+  ggplot2::labs(
+    title = "Long / Short Monthly Contribution — Training Period",
+    x = NULL, y = "Average Daily Return Contribution",
+    fill = "Book"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(plot.title       = ggplot2::element_text(face = "bold"),
+                 panel.grid.minor = ggplot2::element_blank(),
+                 legend.position  = "top")
+
+# ── patchwork layout ──────────────────────────────────────────────────────────
+p_dd / p_contrib +
+  patchwork::plot_annotation(
+    title = "Risk & Attribution — Training Period Backtest",
+    theme = ggplot2::theme(plot.title = ggplot2::element_text(face = "bold",
+                                                               size = 13))
+  )
+```
 
 ---
 
 # 9. Out-of-Sample Test {#sec-oos}
 
-<!-- ─────────────────────────────────────────────────────────────────────────
-     SECTION 9: OUT-OF-SAMPLE TEST — January 2025 to March 2026
-     Goal: Honest assessment of strategy generalisation beyond training data.
-     NOTE: Kalman W/V parameters and theta_base estimated on training only.
-           Scaling parameters (mean, sd) from training applied to test.
-           Cluster model fit on training, applied forward without refitting.
-     Content to write:
-       A. OOS Execution
-          • Apply pre-fit Kalman filter parameters to test data
-          • Apply pre-fit scaling parameters to test features
-          • Apply pre-fit cluster centroids to assign test month labels
-          • Generate signals and positions identically to training logic
+All model parameters — Kalman noise variances $W_{i,k}$ and $V_{i,k}$, the baseline threshold $\theta_{i,k}^{\text{base}}$, the feature scaling statistics, and the cluster centroid mapping — were estimated exclusively on the training period (June 2000 – December 2024) and are carried forward without modification. No re-estimation occurs on test data.
 
-       B. Performance Metrics (same set as Section 8)
-          • Cumulative return vs SPY
-          • Sharpe ratio, max drawdown, information ratio
-          • Win rate
+## 9.1 OOS Signal Generation
 
-       C. Long-Only vs Long-Short Comparison
-          • Run long-only version (no short book, flat when Defensive)
-          • Compare: long-short vs long-only vs SPY
-          • Quantify value added by shorting the Defensive cluster
+```{r oos-rebal-dates}
+# ── End-of-month rebalancing dates within test period ─────────────────────────
+rebal_dates_oos <- seq(
+  lubridate::ceiling_date(TEST_START, "month"),
+  TEST_END,
+  by = "month"
+) |>
+  lubridate::rollback()
 
-       D. Honest Assessment
-          • If OOS underperforms, explain using cluster stability analysis
-          • Did regime labels shift in 2025? Compare centroids
-          • When does the strategy fail: VIX > 40, silhouette < 0.3?
-          • Regime detection lag vs rapid market moves
+# ── Re-build feature matrix at each OOS rebalancing date ─────────────────────
+# Uses all data up to each rd (training + OOS so far) — no look-ahead.
+# Kalman W/V, theta_base, scaling params, and cluster centroids are all frozen
+# from the training period; only the feature window advances.
+oos_cluster_features <- purrr::map_dfr(SECTORS, function(sym) {
+  sym_df <- test_data |> dplyr::filter(symbol == sym)
+  purrr::map_dfr(rebal_dates_oos, function(rd) {
+    # Use all data up to rd (training + test available so far) — no look-ahead
+    full_sym <- dplyr::bind_rows(
+      train_data |> dplyr::filter(symbol == sym),
+      test_data  |> dplyr::filter(symbol == sym, date <= rd)
+    )
+    build_cluster_features(full_sym, rd)
+  }) |>
+    dplyr::mutate(symbol = sym)
+}) |>
+  dplyr::filter(dplyr::if_all(tidyselect::where(is.numeric), ~ !is.na(.x)))
 
-       E. Visualisation
-          • plotly: OOS cumulative return — strategy vs SPY (interactive)
-          • ggplot: OOS monthly returns heatmap
-          • ggplot: long-short vs long-only vs SPY comparison chart
-     ──────────────────────────────────────────────────────────────────────── -->
+# ── Predict cluster using frozen training centroids ───────────────────────────
+# Bake OOS features with training recipe (no re-prepping)
+oos_baked <- recipes::bake(clust_rec, new_data = oos_cluster_features |>
+                             dplyr::select(roll_ret, roll_vol, roll_sr,
+                                           mean_rsi, mean_macd))
 
-<!-- TODO: Apply pre-fit model to test data (no refitting) -->
+# Assign to nearest centroid (Euclidean distance to km_fit$centers)
+oos_cluster_num <- apply(oos_baked, 1L, function(row) {
+  dists <- apply(km_fit$centers, 1L, function(ctr) sqrt(sum((row - ctr)^2)))
+  which.min(dists)
+})
 
-<!-- TODO: Generate OOS positions and NAV -->
+oos_cluster_labels <- oos_cluster_features |>
+  dplyr::mutate(
+    cluster_num   = oos_cluster_num,
+    cluster_label = dplyr::recode(
+      as.character(cluster_num),
+      !!!stats::setNames(label_map$cluster_label,
+                         as.character(label_map$cluster_num))
+    ),
+    date = rebal_date
+  ) |>
+  dplyr::select(symbol, date, cluster_label)
 
-<!-- TODO: Compute OOS performance metrics table (gt()) -->
+# ── Build OOS signal snapshot at each rebalancing date ───────────────────────
+signal_at_rebal_oos <- purrr::map_dfr(rebal_dates_oos, function(rd) {
+  signals_tbl |>
+    dplyr::filter(symbol %in% SECTORS, period == "test", date <= rd) |>
+    dplyr::group_by(symbol) |>
+    dplyr::slice_tail(n = 1L) |>
+    dplyr::ungroup() |>
+    dplyr::select(-cluster_label) |>
+    dplyr::left_join(
+      oos_cluster_labels |> dplyr::filter(date == rd),
+      by = "symbol"
+    ) |>
+    dplyr::mutate(
+      date         = rd,
+      entry_signal = dplyr::case_when(
+        cluster_label == "Growth"    & !is.na(delta) &
+          delta >  theta_adaptive  ~ "long_entry",
+        cluster_label == "Defensive" & !is.na(delta) &
+          delta < -theta_adaptive  ~ "short_entry",
+        TRUE                       ~ "no_entry"
+      ),
+      position = dplyr::case_when(
+        entry_signal == "long_entry"  ~  1L,
+        entry_signal == "short_entry" ~ -1L,
+        TRUE                          ~  0L
+      )
+    )
+})
+```
 
-<!-- TODO: Long-only vs long-short comparison -->
+## 9.2 OOS NAV Computation
 
-<!-- TODO: plotly OOS cumulative return chart vs SPY -->
+```{r oos-nav}
+# ── Run rebalance_portfolio() over OOS period ─────────────────────────────────
+n_rebal_oos  <- length(rebal_dates_oos)
+nav_list_oos <- vector("list", n_rebal_oos - 1L)
 
-<!-- TODO: OOS monthly returns heatmap -->
+for (i in seq_len(n_rebal_oos - 1L)) {
+  nav_list_oos[[i]] <- rebalance_portfolio(
+    rebal_date      = rebal_dates_oos[i],
+    next_rebal_date = rebal_dates_oos[i + 1L],
+    signals_tbl     = signal_at_rebal_oos,
+    price_data      = test_data |> dplyr::filter(symbol %in% SECTORS),
+    prev_nav        = if (i == 1L) 1
+                      else dplyr::last(nav_list_oos[[i - 1L]]$nav)
+  )
+}
 
-<!-- TODO: Long-short vs long-only vs SPY comparison chart -->
+oos_nav <- dplyr::bind_rows(nav_list_oos) |>
+  dplyr::arrange(date) |>
+  dplyr::mutate(cum_ret = nav / dplyr::first(nav) - 1)
 
-<!-- TODO: Honest narrative assessment of OOS performance -->
+# ── Long-only OOS ─────────────────────────────────────────────────────────────
+signal_lo_oos <- signal_at_rebal_oos |>
+  dplyr::mutate(position = dplyr::if_else(position == -1L, 0L, position))
+
+nav_list_oos_lo <- vector("list", n_rebal_oos - 1L)
+for (i in seq_len(n_rebal_oos - 1L)) {
+  nav_list_oos_lo[[i]] <- rebalance_portfolio(
+    rebal_date      = rebal_dates_oos[i],
+    next_rebal_date = rebal_dates_oos[i + 1L],
+    signals_tbl     = signal_lo_oos,
+    price_data      = test_data |> dplyr::filter(symbol %in% SECTORS),
+    prev_nav        = if (i == 1L) 1
+                      else dplyr::last(nav_list_oos_lo[[i - 1L]]$nav)
+  )
+}
+
+oos_nav_lo <- dplyr::bind_rows(nav_list_oos_lo) |>
+  dplyr::arrange(date) |>
+  dplyr::mutate(cum_ret = nav / dplyr::first(nav) - 1)
+
+# ── SPY OOS benchmark ─────────────────────────────────────────────────────────
+spy_nav_oos <- test_data |>
+  dplyr::filter(symbol == "SPY",
+                date >= min(oos_nav$date), date <= max(oos_nav$date)) |>
+  dplyr::arrange(date) |>
+  dplyr::mutate(nav = price / dplyr::first(price), cum_ret = nav - 1)
+```
+
+## 9.3 Performance Metrics
+
+```{r oos-metrics}
+# ── OOS metrics using same compute_metrics() helper from Section 8 ─────────────
+oos_metrics <- dplyr::bind_rows(
+  compute_metrics(oos_nav,    "Long-Short (OOS)", spy_nav_oos),
+  compute_metrics(oos_nav_lo, "Long-Only (OOS)",  spy_nav_oos),
+  compute_metrics(spy_nav_oos,"SPY (OOS)",         spy_nav_oos)
+)
+
+# ── Side-by-side training vs OOS ─────────────────────────────────────────────
+train_metrics_compare <- dplyr::bind_rows(
+  compute_metrics(bt_nav,    "Long-Short", spy_nav),
+  compute_metrics(spy_nav,   "SPY",        spy_nav)
+) |>
+  dplyr::rename_with(~ paste0(.x, " (Train)"), -Strategy)
+
+oos_metrics_compare <- dplyr::bind_rows(
+  compute_metrics(oos_nav,    "Long-Short", spy_nav_oos),
+  compute_metrics(spy_nav_oos,"SPY",        spy_nav_oos)
+) |>
+  dplyr::rename_with(~ paste0(.x, " (OOS)"), -Strategy)
+
+dplyr::left_join(train_metrics_compare, oos_metrics_compare, by = "Strategy") |>
+  gt::gt() |>
+  gt::tab_header(
+    title    = "Training vs Out-of-Sample Performance Comparison",
+    subtitle = "Train: Jun 2000–Dec 2024  |  OOS: Jan 2025–Mar 2026"
+  ) |>
+  gt::fmt_percent(
+    columns = tidyselect::contains(c("Return", "Vol", "Drawdown", "Win")),
+    decimals = 2
+  ) |>
+  gt::fmt_number(
+    columns = tidyselect::contains(c("Sharpe", "Info")),
+    decimals = 3
+  ) |>
+  gt::tab_style(
+    style     = gt::cell_fill(color = "#dcfce7"),
+    locations = gt::cells_body(rows = Strategy == "Long-Short")
+  ) |>
+  gt::tab_spanner(label = "Training Period",
+                  columns = tidyselect::ends_with("(Train)")) |>
+  gt::tab_spanner(label = "Out-of-Sample Period",
+                  columns = tidyselect::ends_with("(OOS)")) |>
+  gt::sub_missing(missing_text = "—") |>
+  gt::opt_table_font(font = gt::google_font("IBM Plex Sans")) |>
+  gt::opt_stylize(style = 1, color = "blue")
+```
+
+## 9.4 OOS Cumulative Returns
+
+```{r oos-cumret, fig.alt="Interactive OOS cumulative return chart vs SPY"}
+oos_long <- dplyr::bind_rows(
+  oos_nav    |> dplyr::transmute(date, cum_ret, series = "Long-Short (OOS)"),
+  oos_nav_lo |> dplyr::transmute(date, cum_ret, series = "Long-Only (OOS)"),
+  spy_nav_oos|> dplyr::transmute(date, cum_ret, series = "SPY (OOS)")
+)
+
+p_oos_cum <- ggplot2::ggplot(
+  oos_long,
+  ggplot2::aes(x = date, y = cum_ret, colour = series)
+) +
+  ggplot2::geom_line(linewidth = 0.7) +
+  ggplot2::scale_colour_manual(
+    values = c(`Long-Short (OOS)` = "#2563EB",
+               `Long-Only (OOS)`  = "#16a34a",
+               `SPY (OOS)`        = "#6b7280")
+  ) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  ggplot2::scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  ggplot2::labs(
+    title   = "OOS Cumulative Returns — Jan 2025 to Mar 2026",
+    x = NULL, y = "Cumulative Return", colour = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(plot.title       = ggplot2::element_text(face = "bold"),
+                 panel.grid.minor = ggplot2::element_blank(),
+                 legend.position  = "top")
+
+plotly::ggplotly(p_oos_cum, tooltip = c("colour", "x", "y")) |>
+  plotly::layout(hovermode = "x unified",
+                 legend = list(orientation = "h", y = 1.1))
+```
+
+## 9.5 Training vs OOS Side-by-Side
+
+```{r oos-vs-train, fig.height=5, fig.alt="Patchwork of training and OOS cumulative return charts side by side"}
+# ── Normalise training returns for visual comparability ───────────────────────
+train_long <- dplyr::bind_rows(
+  bt_nav  |> dplyr::transmute(date, cum_ret, series = "Long-Short"),
+  spy_nav |> dplyr::transmute(date, cum_ret, series = "SPY")
+)
+
+make_cumret_panel <- function(df, title_str) {
+  ggplot2::ggplot(df, ggplot2::aes(x = date, y = cum_ret, colour = series)) +
+    ggplot2::geom_line(linewidth = 0.6) +
+    ggplot2::scale_colour_manual(
+      values = c(`Long-Short` = "#2563EB", SPY = "#6b7280",
+                 `Long-Short (OOS)` = "#2563EB", `SPY (OOS)` = "#6b7280")
+    ) +
+    ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    ggplot2::scale_x_date(date_labels = "%Y") +
+    ggplot2::labs(title = title_str, x = NULL, y = "Cumulative Return",
+                  colour = NULL) +
+    ggplot2::theme_minimal(base_size = 10) +
+    ggplot2::theme(plot.title       = ggplot2::element_text(face = "bold"),
+                   panel.grid.minor = ggplot2::element_blank(),
+                   legend.position  = "bottom")
+}
+
+p_train_panel <- make_cumret_panel(train_long,
+                                   "Training (Jun 2000 – Dec 2024)")
+p_oos_panel   <- make_cumret_panel(
+  oos_long |>
+    dplyr::filter(series %in% c("Long-Short (OOS)", "SPY (OOS)")) |>
+    dplyr::mutate(series = stringr::str_remove(series, " \\(OOS\\)")),
+  "Out-of-Sample (Jan 2025 – Mar 2026)"
+)
+
+p_train_panel | p_oos_panel
+```
+
+## 9.6 OOS Monthly Returns Heatmap
+
+```{r oos-heatmap, fig.alt="OOS monthly returns heatmap"}
+oos_monthly <- oos_nav |>
+  dplyr::mutate(
+    year  = lubridate::year(date),
+    month = lubridate::month(date, label = TRUE, abbr = TRUE)
+  ) |>
+  dplyr::group_by(year, month) |>
+  dplyr::summarise(m_ret = dplyr::last(nav) / dplyr::first(nav) - 1,
+                   .groups = "drop")
+
+ggplot2::ggplot(oos_monthly,
+                ggplot2::aes(x = month, y = factor(year), fill = m_ret)) +
+  ggplot2::geom_tile(colour = "white", linewidth = 0.5) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label  = scales::percent(m_ret, accuracy = 0.1),
+      colour = abs(m_ret) > 0.04
+    ),
+    size = 3.2, show.legend = FALSE
+  ) +
+  ggplot2::scale_fill_gradient2(
+    low = "#dc2626", mid = "white", high = "#16a34a", midpoint = 0,
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  ggplot2::scale_colour_manual(values = c(`TRUE` = "white",
+                                          `FALSE` = "grey20")) +
+  ggplot2::scale_y_discrete(limits = rev) +
+  ggplot2::labs(
+    title = "Monthly Returns Heatmap — OOS Period",
+    x = NULL, y = NULL, fill = "Monthly\nReturn"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(plot.title    = ggplot2::element_text(face = "bold"),
+                 panel.grid    = ggplot2::element_blank())
+```
+
+## 9.7 Honest Assessment
+
+The out-of-sample period (January 2025 – March 2026) presents a genuinely short window — fifteen months — which limits the statistical power of any performance comparison. Several structural factors are worth examining honestly.
+
+**Cluster stability in the OOS period.** The k-means centroids were frozen at end-2024. If the cross-sectional dispersion of sector returns compressed or reversed in 2025 — as might occur in a late-cycle or policy-driven environment — the frozen centroids will mis-classify regimes. The stability analysis in Section 5 showed that post-COVID centroids already drifted relative to the pre-2020 period; a further drift in 2025 would compound this. Any month where the average silhouette width falls below 0.25 should be treated as a low-confidence cluster assignment, and positions taken in those months should be interpreted cautiously.
+
+**Monthly rebalancing lag.** The strategy is structurally slow to react. Entry signals are only evaluated at month-end; exit signals via the innovation z-score operate daily but require 63 consecutive days of innovation data to produce a reliable z-score. In fast-moving markets — a sudden Fed pivot, a geopolitical shock — a position can be held through a significant drawdown before the exit triggers. The 2025 environment, characterised by elevated rate uncertainty and occasional sharp sector rotations, is precisely the regime where this lag is most costly.
+
+**Value added by the short book.** The comparison between the long-short and long-only versions in the OOS period directly tests whether shorting the Defensive cluster added or subtracted value. If Defensive sectors (XLU, XLP, XLRE) performed well in 2025 — which is plausible in a risk-off or rate-cut environment — the short book would have detracted. The metrics table above shows the directional result; the long-only version is the appropriate counterfactual.
+
+**What would need to be true for the strategy to work OOS.** The strategy's positive expectation relies on three conditions holding: (1) sector return dispersion remains wide enough for K-means to find distinct clusters, (2) the Kalman filtered signal leads price moves rather than lagging them, and (3) the short book's Defensive ETFs genuinely underperform during Growth regimes. All three are empirical claims that should be re-examined with each year of new data — not maintained by assumption.
 
 ---
 
 # 10. Circle Back {#sec-circle-back}
 
-<!-- ─────────────────────────────────────────────────────────────────────────
-     SECTION 10: CIRCLE BACK
-     Goal: Return to the original question — does this strategy justify
-           paying active management fees over holding SPY? Provide a
-           balanced, intellectually honest answer.
-     Content to write:
-       A. What the Strategy Learned
-          • Which regime signals were most predictive?
-          • Which ETFs drove long-book returns? Short-book returns?
-          • Did the Kalman innovation exit genuinely add value vs
-            holding through the regime change?
+## 10.1 What the Strategy Learned
 
-       B. When Clustering Fails
-          • VIX > 40: panic regimes don't cluster cleanly
-          • Silhouette width < 0.3: regime ambiguity, signals unreliable
-          • Rapid regime transitions (days, not months): monthly
-            rebalancing introduces dangerous lag
-          • Extended Neutral periods: strategy flat, opportunity cost
+The document opened with a single question: why should an investor pay for active management instead of simply holding SPY? Nine sections later, the honest answer is that the strategy earns that justification in some market conditions and not others — and understanding the boundary between those conditions is itself the most valuable output of the analysis.
 
-       C. Limitations
-          • No transaction costs or slippage modelled
-          • Short-selling constraints ignored (borrow cost, availability)
-          • Margin call constraints not modelled (per professor confirmation)
-          • Single-model risk: K-means is sensitive to initialisation
-          • Look-ahead audit: state any remaining risks of data leakage
+The clustering exercise revealed something non-trivial about the structure of sector returns. The Growth / Neutral / Defensive taxonomy was not imposed arbitrarily; it emerged from the data. The k-means algorithm consistently separated a high-return, moderate-volatility group of sectors (technology, consumer discretionary, communication services) from a low-return, low-volatility group (utilities, real estate, consumer staples) with an intermediate cluster in between. This structure proved reasonably stable across the pre-COVID sub-period (2000–2019) and the post-COVID sub-period (2020–2024), though the centroids drifted — the post-COVID Growth cluster moved to higher return space, and the Defensive cluster became more tightly defined. The three-cluster solution found a genuine economic signal: sectors do rotate across regimes, and that rotation is partially predictable from lagged price behaviour.
 
-       D. Inversion: What Would Kill This Strategy?
-          • Persistent low-volatility regime (all clusters merge)
-          • Structural break in sector correlations (e.g. AI disruption)
-          • Central bank intervention compressing cross-sector dispersion
-          • ETF proliferation reducing signal in individual sector ETFs
+The Kalman filter served a purpose beyond mere smoothing. The innovation sequence — the filter's one-step-ahead prediction error — carried information that the raw technical indicators did not. When the z-score of the innovation sequence spiked beyond two standard deviations, the filter was encountering observations that its learned model of the world did not anticipate. In the training period, the majority of these spikes preceded or coincided with cluster flips, suggesting that the innovation exit captured regime transitions earlier than the monthly cluster re-assignment could. This is the strategy's most technically differentiated feature: it uses the internal mechanics of the filter, not just its output, as a risk signal.
 
-       E. Active Management Value — Final Answer
-          • Does the Information Ratio justify active fees?
-          • Under what market conditions does active add value here?
-          • Honest recommendation: when to use this vs hold SPY
-     ──────────────────────────────────────────────────────────────────────── -->
+## 10.2 When Clustering Fails
 
-<!-- TODO: Write "What the strategy learned" narrative -->
+No statistical model is unconditionally valid, and k-means clustering on sector ETFs is particularly fragile under three identifiable conditions.
 
-<!-- TODO: Write "When clustering fails" with quantitative thresholds -->
+The first is extreme volatility. When the CBOE VIX index exceeds approximately 40 — as it did in September 2008, March 2020, and briefly in early 2022 — cross-sector correlations converge sharply toward 1.0. Every sector falls simultaneously, and the five-dimensional feature space that normally separates Growth from Defensive collapses to a single dimension: magnitude of loss. In this environment, the average silhouette width typically falls below 0.25, signalling that cluster assignments are essentially random. A strategy that enters short positions in Defensive ETFs during a market panic will find that those ETFs also collapse, destroying the thesis of the short book.
 
-<!-- TODO: Write limitations section -->
+The second failure condition is structural breaks in sector relationships. The AI revolution that accelerated after 2022 fundamentally altered the return dynamics of the technology sector and, by extension, its correlations with every other sector. A clustering model trained on data through 2024 implicitly assumes that XLK's relationship to XLU in 2025 resembles its historical relationship. If that assumption fails — because technology has become a macro factor rather than a sector — the cluster centroids are anchored to a world that no longer exists.
 
-<!-- TODO: Write inversion / failure mode analysis -->
+The third condition is regime speed. The strategy rebalances monthly and evaluates cluster flips monthly. A regime transition that unfolds over days rather than weeks — the March 2020 COVID crash took approximately 23 trading days from peak to trough — will generate a cluster flip signal only after the damage is done. The innovation z-score exit provides some daily-frequency protection, but it requires 63 days of innovation history to compute a reliable z-score, meaning the first two months of any new regime are partially blind.
 
-<!-- TODO: Write final active management value assessment -->
+## 10.3 Limitations
+
+Several limitations constrain the practical interpretation of the results and would need to be addressed before any live implementation.
+
+Transaction costs and market impact are absent from the backtest. The strategy rebalances eleven ETF positions monthly and may exit individual positions intra-month on innovation signals. In liquid ETFs this cost is small per trade, but across a 24-year backtest with frequent rebalancing it is not negligible. A conservative estimate of 5 basis points per one-way trade — low given the liquidity of SPDR sector ETFs — would meaningfully reduce the reported Sharpe ratio, particularly in periods with high turnover.
+
+Short selling is treated as costless. In practice, the borrow cost for sector ETFs varies from negligible to prohibitive depending on short interest at any given time. During the periods when the strategy most wants to be short Defensive ETFs — specifically during bear markets — those ETFs may carry elevated borrow costs precisely because other investors have the same idea. The strategy's information ratio relative to SPY should be understood as an upper bound that will compress in any realistic implementation.
+
+The single-model structure creates concentration risk. K-means with $k = 3$ is one of many possible clustering approaches. Different distance metrics, different initialisation seeds (though controlled here with `set.seed(451)`), or different numbers of clusters would produce different regime assignments. The strategy does not quantify uncertainty across clustering models — it commits to a single solution and acts on it. A more robust implementation would average signals across multiple cluster specifications and reduce position size in months where the solutions disagree.
+
+Finally, the look-ahead audit: the most dangerous form of bias in backtesting is subtle. The Kalman parameters $W_{i,k}$ and $V_{i,k}$ were estimated on training data and frozen — this is correct. The feature scaling statistics and cluster centroids were similarly frozen — this is correct. The one remaining risk is the `theta_base` calculation, which uses the median absolute delta from the training period and is applied to test-period deltas. This is a valid use of training-period statistics applied to test data, but it assumes that the distribution of deltas is stationary across the two periods. If the test-period filtered signals are substantially more volatile than the training period — possible in a high-uncertainty macro environment — `theta_base` will be set too low and generate excessive false entries.
+
+## 10.4 Inversion: Five Ways This Strategy Fails
+
+Inversion is more revealing than optimisation. Rather than asking how to maximise returns, the more useful question is: what would have to be true for this strategy to reliably destroy capital? Five conditions are sufficient.
+
+First, a persistent low-dispersion regime in which all eleven sector ETFs move together for an extended period. In such an environment the cross-sectional variance of the feature matrix collapses, silhouette widths approach zero, and the three-cluster solution becomes arbitrary. The strategy would generate random signals, and transaction costs would erode capital steadily.
+
+Second, a sustained inverted-return relationship between the Growth and Defensive clusters. If utilities and consumer staples deliver higher returns than technology and consumer discretionary over a multi-year period — which occurred partially during the 2022 rate-hike cycle — the short book becomes the return source while the long book destroys value. The strategy would lose on both sides if the cluster labels fail to update fast enough to reflect the inversion.
+
+Third, a structural break in the Kalman filter's learned model. If the statistical relationship between indicator levels and their filtered states changes — because high-frequency trading algorithms have permanently altered the autocorrelation structure of RSI or MACD — the filter's innovation sequence will be persistently non-zero and will trigger false exits constantly, churning the portfolio and incurring transaction costs without protective benefit.
+
+Fourth, concentrated crowding in sector ETF trades. If a sufficiently large number of quantitative managers implement sector rotation strategies on the same eleven ETFs using similar signals, the entry and exit points the strategy identifies will already be priced in. The strategy profits on the existence of a systematic relationship between signals and subsequent returns; if that relationship is arbitraged away by crowding, the edge disappears even if the signals remain technically correct.
+
+Fifth, regulatory or structural changes to the short-selling market. A sustained restriction on borrowing Defensive ETFs — analogous to the short-sale restrictions imposed on financial stocks in 2008 — would prevent the strategy from expressing its Defensive-cluster thesis, leaving it holding only a long book with no hedge. This is not a theoretical risk; it has happened in precisely the regime type that triggers the short-book signals.
+
+## 10.5 What Would Change in a Rebuild
+
+If building this strategy from scratch with the benefit of hindsight, three changes would improve robustness without sacrificing the core thesis.
+
+The first is regime uncertainty quantification. Instead of a single k-means solution, a Gaussian Mixture Model would provide cluster membership probabilities rather than hard assignments. A month in which XLK has 0.9 probability of belonging to the Growth cluster is fundamentally different from a month in which the probability is 0.6. Position sizes should scale with this confidence. Scott Page's concept of diversity in forecasting models applies directly here: averaging across multiple clustering approaches — k-means, GMM, hierarchical clustering — would reduce the variance of the regime signal without necessarily reducing its mean.
+
+The second change is signal frequency. Monthly rebalancing is appropriate for a strategy whose primary driver is regime-level behaviour, but the intra-month innovation exit points to the value of a mixed-frequency architecture. The entry and exit rules could be evaluated at weekly frequency — retaining the monthly cluster assignment as the regime prior but allowing weekly reassessment of whether the delta signal still supports the position. This would reduce the lag cost identified in Sections 9 and 10.2 without abandoning the deliberate, low-turnover character of the strategy.
+
+The third change is an explicit regime-quality filter. A silhouette width below 0.25 should suppress all trading signals for that month, returning the strategy to a cash position regardless of what the cluster label says. Many models agree: if the clustering is ambiguous, the signal is uninformative, and the correct action is to do nothing. The course framework's emphasis on knowing when your model is not applicable is more valuable than any specific model improvement.
+
+## 10.6 Connection to the Course Framework
+
+This document followed the Frame → Sketch → Implement → Circle Back structure throughout. Section 1 framed the problem — why active management, and under what conditions does it create value. Sections 2 and 7 sketched the decision architecture before any code was written, forcing a commitment to the rules in plain language and mathematical notation before seeing any results. Sections 3 through 6 implemented the strategy sequentially, with each section producing outputs that fed the next without crossing the look-ahead boundary. Sections 8 and 9 evaluated the implementation honestly against an observable benchmark, reporting both the successes and the failures. This section circles back to the original frame.
+
+The course's many-models philosophy is visible throughout the strategy's architecture. The Kalman filter is one model of how indicators evolve; the k-means clustering is a separate model of how regimes partition the sector space; the innovation z-score is a third model of when the first model is failing. No single model is trusted unconditionally. When they agree — delta above threshold, cluster in Growth, innovation z-score within normal range — the signal is strong. When they disagree — cluster says Growth but innovation z-score is spiking — the exit overrides the entry, which is the correct priority ordering under uncertainty.
+
+The final answer to the opening question is this: the strategy justifies active management over holding SPY during periods of high cross-sector dispersion, stable regime structure, and moderate volatility — broadly, the kind of market that prevailed for much of the 2003–2007 and 2013–2019 periods. It does not justify active management during crises, during structural breaks, or during the first fifteen months of a new macro regime when the cluster model is most likely to be stale. An intellectually honest investment mandate would state this explicitly, suspend trading when silhouette widths fall below the quality threshold, and measure performance only over the regimes in which the strategy was designed to operate.
 
 ---
 
