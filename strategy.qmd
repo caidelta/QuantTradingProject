@@ -1,0 +1,1057 @@
+---
+title: "Clustering-Based Sector Rotation Strategy"
+subtitle: "Active Fund Management via K-Means Regime Detection and Kalman Signal Filtering"
+author: "FIN 451 — Financial Analytics and Trading"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    code-summary: "Show code"
+    fig-width: 10
+    fig-height: 6
+    fig-align: center
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup, include=FALSE}
+# ── Package loading ──────────────────────────────────────────────────────────
+# Packages used via explicit namespace notation throughout (pkg::fn()).
+# require() is used here so a single missing package does not abort the render.
+
+pkgs <- c(
+  "tidyverse", "tidyquant", "tidymodels",
+  "ggplot2", "plotly", "patchwork", "gganimate",
+  "cluster", "factoextra", "moments",
+  "dlm", "KFAS",
+  "gt", "scales", "lubridate", "rlang", "purrr", "zoo", "TTR"
+)
+
+invisible(lapply(pkgs, function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    message("Package not installed: ", p,
+            " — install with install.packages('", p, "')")
+  } else {
+    suppressPackageStartupMessages(require(p, character.only = TRUE))
+  }
+}))
+```
+
+---
+
+# 1. Problem Framing {#sec-framing}
+
+<!-- ─────────────────────────────────────────────────────────────────────────
+     SECTION 1: PROBLEM FRAMING
+     Goal: Establish the investment mandate and motivate why an investor
+           should pay for active management instead of simply holding SPY.
+     Content to write:
+       • Opening hook — the passive vs. active management debate
+       • "Markets as ecosystems" mental model: regimes shift, sectors rotate
+       • Investment mandate: long Growth, short Defensive, flat Neutral
+       • Strategy objectives: superior risk-adjusted return vs. SPY benchmark
+       • Brief road-map of how the rest of the document answers the question
+     ──────────────────────────────────────────────────────────────────────── -->
+
+<!-- TODO: Write narrative prose for Problem Framing -->
+
+---
+
+# 2. Mental Model {#sec-mental-model}
+
+<!-- ─────────────────────────────────────────────────────────────────────────
+     SECTION 2: MENTAL MODEL
+     Goal: Give the reader a single, clear visual of the full decision logic
+           before any code or math is introduced.
+     Content to write:
+       • Mermaid flowchart covering the full pipeline:
+           Data → Feature Engineering → Kalman Filter → Clustering →
+           Regime Label → Entry Signal (delta + adaptive theta) →
+           Exit Signals (innovation z-score OR cluster flip) →
+           Portfolio Construction → Performance Evaluation
+       • Symmetric long/short structure must be visible in the diagram
+       • All entry and exit conditions clearly labelled on diagram edges
+       • Written plain-English decision rules below the diagram
+         (no math yet — that is Section 7)
+     ──────────────────────────────────────────────────────────────────────── -->
+
+<!-- TODO: Insert Mermaid flowchart block -->
+
+<!-- TODO: Write plain-English decision rules below diagram -->
+
+---
+
+# 3. Data {#sec-data}
+
+## 3.1 Asset Universe & Periods
+
+All data is sourced exclusively via API using `tidyquant::tq_get()`. No local files, CSV, or Excel imports are used anywhere in this document.
+
+The strategy trades **11 SPDR sector ETFs**. **SPY is included as a passive benchmark only and is never traded.**
+
+| Role | Tickers |
+|------|---------|
+| Benchmark (not traded) | SPY |
+| Tradeable universe | XLB, XLC, XLE, XLF, XLI, XLK, XLP, XLRE, XLV, XLU, XLY |
+
+> **Note on XLC:** The Communication Services ETF (XLC) launched in June 2018. Observations prior to that date are absent from the raw pull and are handled gracefully — affected rows are simply absent rather than filled or imputed. All downstream calculations are conditioned on data availability per ticker.
+
+```{r data-constants}
+# ── Asset universe ───────────────────────────────────────────────────────────
+BENCHMARK  <- "SPY"
+SECTORS    <- c("XLB", "XLC", "XLE", "XLF", "XLI",
+                "XLK", "XLP", "XLRE", "XLV", "XLU", "XLY")
+ALL_TICKERS <- c(BENCHMARK, SECTORS)
+
+# ── Period boundaries ────────────────────────────────────────────────────────
+TRAIN_START <- lubridate::ymd("2000-06-01")
+TRAIN_END   <- lubridate::ymd("2024-12-31")
+TEST_START  <- lubridate::ymd("2025-01-01")
+TEST_END    <- lubridate::ymd("2026-03-31")
+
+# ── Split boundary label (for chart annotation) ──────────────────────────────
+SPLIT_DATE  <- TEST_START
+```
+
+## 3.2 Data Pull
+
+```{r data-pull}
+# ── Pull daily adjusted prices for all 12 tickers ───────────────────────────
+raw_prices <- tidyquant::tq_get(
+  ALL_TICKERS,
+  get  = "stock.prices",
+  from = TRAIN_START,
+  to   = TEST_END
+) |>
+  dplyr::select(symbol, date, adjusted) |>
+  dplyr::rename(price = adjusted) |>
+  dplyr::arrange(symbol, date)
+
+# ── Sanity check: confirm retrieval ─────────────────────────────────────────
+raw_prices |>
+  dplyr::group_by(symbol) |>
+  dplyr::summarise(
+    first_date = min(date),
+    last_date  = max(date),
+    n_obs      = dplyr::n(),
+    .groups    = "drop"
+  ) |>
+  dplyr::arrange(symbol)
+```
+
+## 3.3 Train / Test Split
+
+```{r data-split}
+# ── Training window: June 2000 – December 2024 ───────────────────────────────
+train_data <- raw_prices |>
+  dplyr::filter(date >= TRAIN_START, date <= TRAIN_END)
+
+# ── Test window: January 2025 – March 2026 ───────────────────────────────────
+test_data <- raw_prices |>
+  dplyr::filter(date >= TEST_START, date <= TEST_END)
+```
+
+## 3.4 Indexed Price Chart
+
+Prices are indexed to **100 at each ticker's first available trading date** so that all series are visually comparable regardless of absolute price level. The dashed vertical line marks the boundary between the training and test periods.
+
+```{r data-index}
+# ── Index each ticker to 100 at its own first available date ─────────────────
+prices_indexed <- raw_prices |>
+  dplyr::group_by(symbol) |>
+  dplyr::mutate(
+    base_price    = dplyr::first(price),
+    indexed_price = price / base_price * 100
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select(symbol, date, indexed_price)
+```
+
+```{r chart-indexed, fig.alt="Interactive chart of all 12 ETFs indexed to 100 at first available date"}
+# ── Base ggplot ───────────────────────────────────────────────────────────────
+p_indexed <- ggplot2::ggplot(
+  prices_indexed,
+  ggplot2::aes(x = date, y = indexed_price, colour = symbol, group = symbol)
+) +
+  ggplot2::geom_line(linewidth = 0.45, alpha = 0.85) +
+  ggplot2::geom_vline(
+    xintercept = as.numeric(SPLIT_DATE),
+    linetype   = "dashed",
+    colour     = "grey30",
+    linewidth  = 0.6
+  ) +
+  ggplot2::annotate(
+    "text",
+    x      = SPLIT_DATE + lubridate::days(60),
+    y      = max(prices_indexed$indexed_price, na.rm = TRUE) * 0.97,
+    label  = "← Train  |  Test →",
+    size   = 3,
+    hjust  = 0,
+    colour = "grey30"
+  ) +
+  ggplot2::scale_colour_manual(
+    values = scales::hue_pal()(length(ALL_TICKERS))
+  ) +
+  ggplot2::scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y"
+  ) +
+  ggplot2::scale_y_continuous(
+    labels = scales::comma_format(suffix = "")
+  ) +
+  ggplot2::labs(
+    title    = "SPDR Sector ETFs — Indexed to 100 at First Available Date",
+    subtitle = "Daily adjusted closing prices  |  Dashed line = Train/Test split (Jan 2025)",
+    x        = NULL,
+    y        = "Indexed Price (base = 100)",
+    colour   = "Ticker",
+    caption  = "Source: Yahoo Finance via tidyquant::tq_get()"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    legend.position  = "right",
+    panel.grid.minor = ggplot2::element_blank(),
+    plot.title       = ggplot2::element_text(face = "bold")
+  )
+
+# ── Wrap in plotly for interactivity ─────────────────────────────────────────
+plotly::ggplotly(p_indexed, tooltip = c("colour", "x", "y")) |>
+  plotly::layout(
+    hovermode = "x unified",
+    legend    = list(title = list(text = "<b>Ticker</b>"))
+  )
+```
+
+## 3.5 Summary Statistics
+
+```{r summary-stats}
+# ── Compute per-ETF summary statistics on the full raw series ────────────────
+etf_summary <- raw_prices |>
+  dplyr::group_by(symbol) |>
+  dplyr::mutate(
+    daily_return = (price / dplyr::lag(price)) - 1
+  ) |>
+  dplyr::summarise(
+    `First Date`      = min(date),
+    `Last Date`       = max(date),
+    `Observations`    = dplyr::n(),
+    `Mean Dly Ret`    = mean(daily_return, na.rm = TRUE),
+    `Ann. Vol`        = sd(daily_return, na.rm = TRUE) * sqrt(252),
+    `Min Price`       = min(price, na.rm = TRUE),
+    `Max Price`       = max(price, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    `Role` = dplyr::if_else(symbol == "SPY", "Benchmark", "Tradeable")
+  ) |>
+  dplyr::arrange(dplyr::desc(`Role`), symbol)
+
+# ── Render as formatted gt table ─────────────────────────────────────────────
+etf_summary |>
+  gt::gt() |>
+  gt::tab_header(
+    title    = "Asset Universe — Summary Statistics",
+    subtitle = "Full sample: June 2000 – March 2026 | Adjusted closing prices"
+  ) |>
+  gt::fmt_date(columns = c(`First Date`, `Last Date`), date_style = "yMd") |>
+  gt::fmt_number(columns = `Observations`, use_seps = TRUE, decimals = 0) |>
+  gt::fmt_percent(columns = c(`Mean Dly Ret`, `Ann. Vol`), decimals = 2) |>
+  gt::fmt_currency(columns = c(`Min Price`, `Max Price`), currency = "USD",
+                   decimals = 2) |>
+  gt::tab_style(
+    style     = gt::cell_fill(color = "#f0f4ff"),
+    locations = gt::cells_body(rows = `Role` == "Benchmark")
+  ) |>
+  gt::tab_style(
+    style     = gt::cell_text(weight = "bold"),
+    locations = gt::cells_column_labels()
+  ) |>
+  gt::cols_label(symbol = "Ticker") |>
+  gt::tab_footnote(
+    footnote  = "XLC launched June 2018; prior observations are absent, not imputed.",
+    locations = gt::cells_body(columns = `First Date`,
+                               rows    = symbol == "XLC")
+  ) |>
+  gt::tab_footnote(
+    footnote  = "SPY is a benchmark only and is excluded from all portfolio positions.",
+    locations = gt::cells_body(columns = `Role`,
+                               rows    = symbol == "SPY")
+  ) |>
+  gt::opt_table_font(font = gt::google_font("IBM Plex Sans")) |>
+  gt::opt_stylize(style = 1, color = "blue")
+```
+
+---
+
+# 4. Feature Engineering {#sec-features}
+
+## 4.1 Technical Indicators
+
+Four technical indicators are computed daily for each of the 11 tradeable sector ETFs using the `TTR` package. These are the raw observations that will subsequently be fed into the Kalman filter. SPY is excluded from feature engineering — it is never traded.
+
+| Indicator | Formula / Window | Economic Intuition |
+|-----------|------------------|--------------------|
+| **RSI** | 14-day Wilder RSI | Momentum oscillator bounded [0, 100]; values above 70 indicate overbought conditions, below 30 oversold |
+| **MACD** | EMA(12) − EMA(26), signal EMA(9) | Captures trend acceleration; the MACD line crossing its signal line signals directional shifts |
+| **ROC** | $(P_t - P_{t-10}) / P_{t-10}$ | 10-day rate of change; measures near-term price momentum |
+| **Bollinger %B** | $(P_t - \text{Lower}) / (\text{Upper} - \text{Lower})$ | Position of price within 20-day, 2-SD bands; >1 or <0 flags breakouts |
+
+```{r compute-indicators}
+# ── Compute all four indicators for every tradeable ETF ──────────────────────
+# Input: train_data and test_data from Section 3 (adjusted daily prices)
+# Output: raw_indicators — long-format tibble, one row per ETF × date × indicator
+
+compute_indicators <- function(df) {
+  prices <- df$price
+
+  rsi_vals  <- TTR::RSI(prices, n = 14)
+
+  macd_obj  <- TTR::MACD(prices, nFast = 12, nSlow = 26, nSig = 9)
+  macd_vals <- macd_obj[, "macd"] - macd_obj[, "signal"]
+
+  roc_vals  <- TTR::ROC(prices, n = 10, type = "discrete")
+
+  bb_obj    <- TTR::BBands(prices, n = 20, sd = 2)
+  pctb_vals <- bb_obj[, "pctB"]
+
+  tibble::tibble(
+    date      = df$date,
+    RSI       = as.numeric(rsi_vals),
+    MACD      = as.numeric(macd_vals),
+    ROC       = as.numeric(roc_vals),
+    BollingerB = as.numeric(pctb_vals)
+  )
+}
+
+# Apply to training data for each sector ETF (not SPY)
+raw_indicators_train <- train_data |>
+  dplyr::filter(symbol %in% SECTORS) |>
+  dplyr::group_by(symbol) |>
+  dplyr::group_modify(~ compute_indicators(.x)) |>
+  dplyr::ungroup() |>
+  tidyr::pivot_longer(
+    cols      = c(RSI, MACD, ROC, BollingerB),
+    names_to  = "indicator",
+    values_to = "raw_value"
+  ) |>
+  dplyr::filter(!is.na(raw_value))
+
+# Apply to test data
+raw_indicators_test <- test_data |>
+  dplyr::filter(symbol %in% SECTORS) |>
+  dplyr::group_by(symbol) |>
+  dplyr::group_modify(~ compute_indicators(.x)) |>
+  dplyr::ungroup() |>
+  tidyr::pivot_longer(
+    cols      = c(RSI, MACD, ROC, BollingerB),
+    names_to  = "indicator",
+    values_to = "raw_value"
+  ) |>
+  dplyr::filter(!is.na(raw_value))
+```
+
+## 4.2 Kalman Filter
+
+### 4.2.1 State-Space Model
+
+Raw technical indicators are noisy — they react to microstructure noise, bid-ask bounce, and short-lived price dislocations that carry no regime information. A Kalman filter estimates the latent *true* state of each indicator, stripping out observation noise while tracking genuine directional changes.
+
+The model is a random-walk state space applied separately to each (ETF, indicator) pair:
+
+$$x_t = x_{t-1} + w_t, \quad w_t \sim \mathcal{N}(0,\, W)$$
+
+$$y_t = x_t + v_t, \quad v_t \sim \mathcal{N}(0,\, V)$$
+
+where $x_t$ is the unobserved latent state, $y_t$ is the observed indicator value, $W$ is the process noise variance (how much the true signal drifts), and $V$ is the observation noise variance (measurement error). A higher $W/V$ ratio makes the filter more responsive; a lower ratio gives heavier smoothing.
+
+**Critical constraint:** $W$ and $V$ are estimated via maximum likelihood on the **training period only**. The fitted parameters are then frozen and applied forward to the test period. This enforces strict temporal separation and eliminates look-ahead bias.
+
+### 4.2.2 Parameter Estimation & Filtering
+
+```{r kalman-fit, warning=FALSE}
+# ── Fit Kalman parameters (W, V) via MLE on training data only ───────────────
+# Returns a list with: filtered_state, P_t (state variance), innovation
+
+fit_and_filter_kalman <- function(y_obs) {
+  # Remove leading NAs from indicator warm-up period
+  valid_idx <- which(!is.na(y_obs))
+  if (length(valid_idx) < 30L) {
+    return(tibble::tibble(
+      filtered_state = rep(NA_real_, length(y_obs)),
+      P_t            = rep(NA_real_, length(y_obs)),
+      innovation     = rep(NA_real_, length(y_obs))
+    ))
+  }
+  y_clean <- y_obs[valid_idx]
+
+  # Build random-walk DLM: FF=1 (observation), GG=1 (state transition),
+  # V (obs noise), W (process noise) — both estimated via MLE
+  build_fn <- function(pars) {
+    dlm::dlm(
+      FF = matrix(1),
+      GG = matrix(1),
+      V  = exp(pars[1]),   # log-transform keeps variance positive
+      W  = exp(pars[2]),
+      m0 = matrix(y_clean[1]),
+      C0 = matrix(100)     # diffuse prior
+    )
+  }
+
+  # MLE fit on training observations
+  mle_fit <- dlm::dlmMLE(
+    y     = y_clean,
+    parm  = c(0, 0),       # initialise log(V), log(W) at 0
+    build = build_fn,
+    control = list(maxit = 500)
+  )
+
+  fitted_model <- build_fn(mle_fit$par)
+
+  # Forward Kalman filter pass
+  kf <- dlm::dlmFilter(y_clean, fitted_model)
+
+  # Extract outputs — drop t=0 prior state to align with observations
+  f_state <- as.numeric(kf$m[-1])               # filtered state x̂_t
+  p_vals  <- as.numeric(dlm::dlmSvd2var(kf$U.C, kf$D.C)[-1])  # P_t
+  innov   <- as.numeric(kf$y - kf$f)            # innovation v_t = y_t - ŷ_t
+
+  # Re-insert NAs for warm-up rows so length matches original y_obs
+  out <- tibble::tibble(
+    filtered_state = rep(NA_real_, length(y_obs)),
+    P_t            = rep(NA_real_, length(y_obs)),
+    innovation     = rep(NA_real_, length(y_obs))
+  )
+  out$filtered_state[valid_idx] <- f_state
+  out$P_t[valid_idx]            <- p_vals
+  out$innovation[valid_idx]     <- innov
+  out
+}
+
+# ── Apply to every (symbol, indicator) combination in training data ───────────
+# Each pair gets its own independently estimated W and V
+kalman_params_train <- raw_indicators_train |>
+  dplyr::group_by(symbol, indicator) |>
+  dplyr::group_modify(function(.x, .y) {
+    kf_out <- fit_and_filter_kalman(.x$raw_value)
+    dplyr::bind_cols(.x, kf_out)
+  }) |>
+  dplyr::ungroup()
+```
+
+### 4.2.3 Applying Frozen Parameters to the Test Period
+
+The MLE-estimated model parameters are derived entirely from training data. To apply them to the test period without refitting, we re-run the filter forward using the final training state as the initial condition.
+
+```{r kalman-apply-test, warning=FALSE}
+# ── Helper: apply a pre-fit DLM to new observations ──────────────────────────
+apply_frozen_kalman <- function(train_y, test_y) {
+  valid_train <- which(!is.na(train_y))
+  if (length(valid_train) < 30L) {
+    return(tibble::tibble(
+      filtered_state = rep(NA_real_, length(test_y)),
+      P_t            = rep(NA_real_, length(test_y)),
+      innovation     = rep(NA_real_, length(test_y))
+    ))
+  }
+  y_train_clean <- train_y[valid_train]
+
+  build_fn <- function(pars) {
+    dlm::dlm(FF = matrix(1), GG = matrix(1),
+              V = exp(pars[1]), W = exp(pars[2]),
+              m0 = matrix(y_train_clean[1]), C0 = matrix(100))
+  }
+
+  mle_fit     <- dlm::dlmMLE(y_train_clean, c(0, 0), build_fn,
+                              control = list(maxit = 500))
+  fitted_mod  <- build_fn(mle_fit$par)
+
+  # Filter training data to get terminal state for initialisation
+  kf_train    <- dlm::dlmFilter(y_train_clean, fitted_mod)
+  n_tr        <- length(y_train_clean)
+  m_terminal  <- as.numeric(kf_train$m[n_tr + 1])
+  C_terminal  <- as.numeric(dlm::dlmSvd2var(kf_train$U.C, kf_train$D.C)[n_tr + 1])
+
+  # Re-initialise model at terminal training state — NO refitting
+  fitted_mod$m0 <- matrix(m_terminal)
+  fitted_mod$C0 <- matrix(C_terminal)
+
+  valid_test <- which(!is.na(test_y))
+  out <- tibble::tibble(
+    filtered_state = rep(NA_real_, length(test_y)),
+    P_t            = rep(NA_real_, length(test_y)),
+    innovation     = rep(NA_real_, length(test_y))
+  )
+
+  if (length(valid_test) == 0L) return(out)
+
+  y_test_clean <- test_y[valid_test]
+  kf_test      <- dlm::dlmFilter(y_test_clean, fitted_mod)
+
+  out$filtered_state[valid_test] <- as.numeric(kf_test$m[-1])
+  out$P_t[valid_test]            <- as.numeric(
+    dlm::dlmSvd2var(kf_test$U.C, kf_test$D.C)[-1])
+  out$innovation[valid_test]     <- as.numeric(kf_test$y - kf_test$f)
+  out
+}
+
+# ── Apply frozen parameters to test data ────────────────────────────────────
+kalman_params_test <- raw_indicators_test |>
+  dplyr::group_by(symbol, indicator) |>
+  dplyr::group_modify(function(.x, .y) {
+    # Retrieve matching training series for this (symbol, indicator) pair
+    train_series <- raw_indicators_train |>
+      dplyr::filter(symbol == .y$symbol, indicator == .y$indicator) |>
+      dplyr::pull(raw_value)
+
+    kf_out <- apply_frozen_kalman(train_series, .x$raw_value)
+    dplyr::bind_cols(.x, kf_out)
+  }) |>
+  dplyr::ungroup()
+
+# ── Combine training and test Kalman outputs into a single tidy tibble ────────
+kalman_all <- dplyr::bind_rows(
+  dplyr::mutate(kalman_params_train, period = "train"),
+  dplyr::mutate(kalman_params_test,  period = "test")
+) |>
+  dplyr::select(symbol, date, indicator, period,
+                raw_value, filtered_state, P_t, innovation) |>
+  dplyr::arrange(symbol, indicator, date)
+```
+
+## 4.3 Delta Signal & Adaptive Threshold
+
+### 4.3.1 Delta: First Difference of Filtered State
+
+The filtered state $\hat{x}_t$ tells us the Kalman filter's best estimate of the indicator's current level. The **delta** is its first difference:
+
+$$\delta_t = \hat{x}_t - \hat{x}_{t-1}$$
+
+Delta measures the *rate of change* of the smoothed signal — analogous to velocity in a physical system. A positive $\delta_t$ means the filtered signal is accelerating upward; negative means it is decelerating or reversing. This is the entry trigger quantity: we want to enter positions when the smoothed signal has genuine directional momentum, not just a level reading.
+
+### 4.3.2 Adaptive Threshold Scaled by State Covariance
+
+The Kalman filter outputs the state covariance $P_t$ alongside the filtered state. $P_t$ measures the filter's own uncertainty about its state estimate — it rises when the filter is being surprised by observations (regime transition) and falls when the model fits well (stable regime).
+
+The adaptive entry threshold uses $P_t$ directly:
+
+$$\theta_{\text{adaptive},t} = \theta_{\text{base}} \cdot \sqrt{P_t}$$
+
+where $\theta_{\text{base}}$ is estimated as the median absolute delta over the **training period only**. The intuition:
+
+- **High $P_t$ (high uncertainty):** the filter is confused — require a larger $|\delta_t|$ to enter, avoiding false signals during regime transitions
+- **Low $P_t$ (high certainty):** the filter is confident — allow smaller $|\delta_t|$ to trigger entries, capturing early momentum
+
+```{r compute-delta}
+# ── Compute delta and adaptive threshold from Kalman outputs ─────────────────
+kalman_all <- kalman_all |>
+  dplyr::group_by(symbol, indicator) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(
+    delta = filtered_state - dplyr::lag(filtered_state)
+  ) |>
+  dplyr::ungroup()
+
+# ── Estimate theta_base per (symbol, indicator) on TRAINING data only ─────────
+theta_base_tbl <- kalman_all |>
+  dplyr::filter(period == "train", !is.na(delta)) |>
+  dplyr::group_by(symbol, indicator) |>
+  dplyr::summarise(
+    theta_base = stats::median(abs(delta), na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+# ── Join theta_base back and compute adaptive threshold ──────────────────────
+kalman_all <- kalman_all |>
+  dplyr::left_join(theta_base_tbl, by = c("symbol", "indicator")) |>
+  dplyr::mutate(
+    theta_adaptive = theta_base * sqrt(P_t)
+  )
+```
+
+## 4.4 Innovation Sequence & Rolling Z-Score
+
+The Kalman innovation at time $t$ is defined as the one-step-ahead prediction error:
+
+$$v_t = y_t - \hat{y}_{t|t-1}$$
+
+Under a correctly specified model, innovations should be approximately white noise with zero mean. When the innovation z-score spikes — i.e., the filter is being repeatedly surprised — this is statistical evidence of a regime break. This forms the primary exit signal (Section 6).
+
+```{r compute-innovation-zscore}
+# ── Rolling z-score of innovation sequence (60-day window) ───────────────────
+kalman_all <- kalman_all |>
+  dplyr::group_by(symbol, indicator) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(
+    innov_roll_mean = zoo::rollapply(
+      innovation, width = 60, FUN = mean,
+      fill = NA, align = "right", na.rm = TRUE
+    ),
+    innov_roll_sd = zoo::rollapply(
+      innovation, width = 60, FUN = sd,
+      fill = NA, align = "right", na.rm = TRUE
+    ),
+    innovation_zscore = dplyr::if_else(
+      innov_roll_sd > 0,
+      (innovation - innov_roll_mean) / innov_roll_sd,
+      NA_real_
+    )
+  ) |>
+  dplyr::ungroup()
+```
+
+## 4.5 Visualisation: XLK — Raw vs Filtered Signals
+
+XLK (Technology) is used as the illustrative ETF throughout this section. Its high volatility and distinct trend cycles make it the most visually informative sector for demonstrating Kalman smoothing.
+
+The 2×2 grid below shows all four indicators over the training period. In each panel the grey line is the raw TTR indicator; the coloured line is the Kalman filtered state $\hat{x}_t$.
+
+```{r chart-raw-vs-filtered, fig.height=10, fig.alt="2x2 grid of raw vs Kalman filtered signals for XLK across all four indicators"}
+# ── Prepare XLK training data for plotting ───────────────────────────────────
+xlk_plot_data <- kalman_all |>
+  dplyr::filter(symbol == "XLK", period == "train",
+                !is.na(filtered_state)) |>
+  dplyr::select(date, indicator, raw_value, filtered_state)
+
+indicator_labels <- c(
+  RSI        = "RSI (14-day)",
+  MACD       = "MACD Line − Signal",
+  ROC        = "Rate of Change (10-day)",
+  BollingerB = "Bollinger Band %B"
+)
+
+# ── Build one panel per indicator ────────────────────────────────────────────
+make_panel <- function(ind_name) {
+  df <- xlk_plot_data |> dplyr::filter(indicator == ind_name)
+
+  ggplot2::ggplot(df, ggplot2::aes(x = date)) +
+    ggplot2::geom_line(
+      ggplot2::aes(y = raw_value),
+      colour = "grey70", linewidth = 0.35, alpha = 0.8
+    ) +
+    ggplot2::geom_line(
+      ggplot2::aes(y = filtered_state),
+      colour = "#2563EB", linewidth = 0.65
+    ) +
+    ggplot2::scale_x_date(date_breaks = "4 years", date_labels = "%Y") +
+    ggplot2::labs(
+      title    = indicator_labels[ind_name],
+      subtitle = "Grey = raw  |  Blue = Kalman filtered state",
+      x        = NULL,
+      y        = ind_name
+    ) +
+    ggplot2::theme_minimal(base_size = 10) +
+    ggplot2::theme(
+      panel.grid.minor = ggplot2::element_blank(),
+      plot.title       = ggplot2::element_text(face = "bold", size = 10)
+    )
+}
+
+p_rsi  <- make_panel("RSI")
+p_macd <- make_panel("MACD")
+p_roc  <- make_panel("ROC")
+p_bb   <- make_panel("BollingerB")
+
+# ── 2x2 patchwork layout ─────────────────────────────────────────────────────
+(p_rsi | p_macd) / (p_roc | p_bb) +
+  patchwork::plot_annotation(
+    title   = "XLK — Raw vs Kalman Filtered Technical Indicators (Training Period)",
+    caption = "Training period: June 2000 – December 2024",
+    theme   = ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", size = 12)
+    )
+  )
+```
+
+```{r chart-delta-threshold, fig.alt="XLK RSI delta signal with adaptive threshold bands"}
+# ── Delta + adaptive threshold chart for XLK RSI ─────────────────────────────
+xlk_delta_data <- kalman_all |>
+  dplyr::filter(symbol == "XLK", indicator == "RSI",
+                period == "train", !is.na(delta))
+
+ggplot2::ggplot(xlk_delta_data, ggplot2::aes(x = date)) +
+  ggplot2::geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.4) +
+  ggplot2::geom_line(
+    ggplot2::aes(y = delta),
+    colour = "#1D4ED8", linewidth = 0.45, alpha = 0.85
+  ) +
+  ggplot2::geom_line(
+    ggplot2::aes(y =  theta_adaptive),
+    colour = "#DC2626", linewidth = 0.5, linetype = "dashed"
+  ) +
+  ggplot2::geom_line(
+    ggplot2::aes(y = -theta_adaptive),
+    colour = "#DC2626", linewidth = 0.5, linetype = "dashed"
+  ) +
+  ggplot2::scale_x_date(date_breaks = "4 years", date_labels = "%Y") +
+  ggplot2::labs(
+    title    = "XLK RSI — Delta Signal with Adaptive Entry Threshold",
+    subtitle = "Blue = δ_t  |  Red dashed = ±θ_adaptive = θ_base · √P_t",
+    x        = NULL,
+    y        = "Delta (filtered state first difference)",
+    caption  = "Entry triggered when |δ_t| exceeds the adaptive threshold"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    plot.title       = ggplot2::element_text(face = "bold")
+  )
+```
+
+```{r chart-innovation-zscore, fig.alt="XLK RSI Kalman innovation z-score with exit threshold lines"}
+# ── Innovation z-score chart for XLK RSI ────────────────────────────────────
+xlk_innov_data <- kalman_all |>
+  dplyr::filter(symbol == "XLK", indicator == "RSI",
+                period == "train", !is.na(innovation_zscore))
+
+ggplot2::ggplot(xlk_innov_data, ggplot2::aes(x = date)) +
+  ggplot2::geom_hline(yintercept =  0, colour = "grey50",  linewidth = 0.4) +
+  ggplot2::geom_hline(yintercept =  2, colour = "#DC2626", linewidth = 0.55,
+                      linetype = "dashed") +
+  ggplot2::geom_hline(yintercept = -2, colour = "#DC2626", linewidth = 0.55,
+                      linetype = "dashed") +
+  ggplot2::geom_line(
+    ggplot2::aes(y = innovation_zscore),
+    colour = "#059669", linewidth = 0.45, alpha = 0.85
+  ) +
+  ggplot2::annotate("text", x = min(xlk_innov_data$date) + lubridate::days(200),
+                    y = 2.3, label = "Exit threshold (+2)", colour = "#DC2626",
+                    size = 3, hjust = 0) +
+  ggplot2::annotate("text", x = min(xlk_innov_data$date) + lubridate::days(200),
+                    y = -2.3, label = "Exit threshold (−2)", colour = "#DC2626",
+                    size = 3, hjust = 0) +
+  ggplot2::scale_x_date(date_breaks = "4 years", date_labels = "%Y") +
+  ggplot2::labs(
+    title    = "XLK RSI — Kalman Innovation Z-Score (60-Day Rolling)",
+    subtitle = "Spikes beyond ±2 signal filter surprise — potential regime break → exit trigger",
+    x        = NULL,
+    y        = "Innovation Z-Score",
+    caption  = "Innovation v_t = observed_t − predicted_t  |  Z-score computed on 60-day rolling window"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    plot.title       = ggplot2::element_text(face = "bold")
+  )
+```
+
+---
+
+# 5. Clustering {#sec-clustering}
+
+<!-- ─────────────────────────────────────────────────────────────────────────
+     SECTION 5: CLUSTERING
+     Goal: Identify market regimes via K-means; validate and label clusters.
+     Content to write:
+       A. Elbow Plot
+          • Within-cluster sum of squares (WCSS) for k = 2..10
+          • Identify optimal k visually and justify choice
+
+       B. K-Means via tidymodels
+          • recipe() → step_scale() → step_center() → prep() → bake()
+          • kmeans() on baked training features
+          • Monthly cluster assignment: cluster at each end-of-month date
+          • Use lubridate::rollback() for end-of-month dates
+          • Never use future data in cluster assignment (no look-ahead)
+
+       C. Silhouette Analysis
+          • Compute silhouette width for each observation
+          • Average silhouette width as cluster quality metric
+          • Plot silhouette widths, flag low-quality assignments
+
+       D. Cluster Labelling
+          • Interpret clusters as Growth / Neutral / Defensive
+          • Show cluster centroid values per feature
+          • Map numeric cluster IDs to regime labels consistently
+
+       E. Visualisation
+          • Static ggplot: PCA-reduced cluster scatter (training period)
+          • gganimate: animated cluster membership month-by-month
+
+       F. Stability Analysis
+          • Re-cluster on pre-COVID (to 2019-12-31) and post-COVID
+            (2020-01-01 onward) sub-periods separately
+          • Compare centroids and label assignments
+          • Discuss regime stability implications for out-of-sample use
+     ──────────────────────────────────────────────────────────────────────── -->
+
+<!-- TODO: Elbow plot for k = 2..10 -->
+
+<!-- TODO: tidymodels K-means pipeline -->
+
+<!-- TODO: Monthly cluster assignment at rollback() dates -->
+
+<!-- TODO: Silhouette analysis and plot -->
+
+<!-- TODO: Cluster centroid table and label mapping -->
+
+<!-- TODO: Static ggplot PCA scatter -->
+
+<!-- TODO: gganimate animated cluster membership chart -->
+
+<!-- TODO: Stability analysis — pre vs post COVID sub-periods -->
+
+---
+
+# 6. Signal Generation {#sec-signals}
+
+<!-- ─────────────────────────────────────────────────────────────────────────
+     SECTION 6: SIGNAL GENERATION
+     Goal: Combine cluster regime label with Kalman delta to produce
+           actionable long/short entry signals, and define exit triggers.
+     Content to write:
+       A. Entry Logic
+          • Condition: cluster != "Neutral" AND |delta_t| > theta_adaptive
+          • Growth cluster  → LONG  (delta must be positive)
+          • Defensive cluster → SHORT (delta must be negative)
+          • Neutral cluster  → FLAT  (no position taken)
+
+       B. Exit Logic — Primary (Innovation Z-Score)
+          • Compute rolling z-score of Kalman innovation sequence
+          • Exit when |z_score(innovation_t)| > 2
+          • Applies symmetrically to long and short positions
+          • Rationale: filter is "surprised" — regime may have broken
+
+       C. Exit Logic — Secondary (Cluster Flip)
+          • Exit long  when cluster flips from Growth to Neutral/Defensive
+          • Exit short when cluster flips from Defensive to Neutral/Growth
+          • Evaluated only at monthly rebalancing dates
+          • Provides orthogonal regime-level risk management
+
+       D. Visualisation
+          • Time series chart: filtered signal + delta + entry/exit markers
+          • Show both a long-entry example and a short-entry example
+          • Annotate innovation z-score spikes that triggered exits
+     ──────────────────────────────────────────────────────────────────────── -->
+
+<!-- TODO: Implement entry signal logic (delta + cluster) -->
+
+<!-- TODO: Implement primary exit: innovation z-score > 2 -->
+
+<!-- TODO: Implement secondary exit: cluster flip at rebalance date -->
+
+<!-- TODO: Chart: filtered signal + delta + entry/exit markers (long example) -->
+
+<!-- TODO: Chart: filtered signal + delta + entry/exit markers (short example) -->
+
+---
+
+# 7. Decision Rules (Formal) {#sec-rules}
+
+<!-- ─────────────────────────────────────────────────────────────────────────
+     SECTION 7: DECISION RULES — FORMAL STATEMENT
+     Goal: State every decision rule mathematically, unambiguously.
+           Professor grades explicitly on clarity here.
+     Content to write:
+       • Numbered list of all rules using LaTeX math blocks
+       1. Kalman state-space model equations
+       2. Delta definition: δ_t = x̂_t − x̂_{t−1}
+       3. Adaptive threshold: θ_t = θ_base · √P_t
+       4. Entry rule — Long:
+            c_t = "Growth" AND δ_t > +θ_t  →  w_i > 0
+       5. Entry rule — Short:
+            c_t = "Defensive" AND δ_t < −θ_t  →  w_i < 0
+       6. No-trade rule — Neutral:
+            c_t = "Neutral"  →  w_i = 0
+       7. Primary exit — Innovation spike:
+            |z(v_t)| > 2  →  close position immediately
+       8. Secondary exit — Cluster flip:
+            c_t ≠ c_{t−1} at rebalance date  →  close position
+       9. Inverse volatility weighting formula:
+            w_i = (1/σ_i) / Σ_j (1/σ_j)   [long book, positive]
+            w_i = −(1/σ_i) / Σ_j (1/σ_j)  [short book, negative]
+      10. Monthly rebalancing timing:
+            t* = lubridate::rollback(first day of next month)
+     ──────────────────────────────────────────────────────────────────────── -->
+
+<!-- TODO: Write all formal decision rules with LaTeX math notation -->
+
+---
+
+# 8. Training Period Backtest {#sec-training}
+
+<!-- ─────────────────────────────────────────────────────────────────────────
+     SECTION 8: TRAINING PERIOD BACKTEST — June 2000 to December 2024
+     Goal: Evaluate strategy performance over in-sample period vs SPY.
+     Content to write:
+       A. Portfolio Construction
+          • Implement rebalance_portfolio() function
+          • Inverse volatility weighting within active cluster
+          • Negative weights for Defensive (short) book
+          • Flat (cash) during Neutral regime
+          • Monthly rebalancing at rollback() end-of-month dates
+          • Track: portfolio NAV, per-ETF allocations, monthly turnover
+
+       B. Performance Metrics
+          • Cumulative return vs SPY (both on same chart)
+          • Annualised return, annualised volatility
+          • Sharpe ratio (annualised, risk-free = 0 or 3-month T-bill)
+          • Maximum drawdown and drawdown duration
+          • Information ratio: active return / tracking error vs SPY
+          • Win rate of individual monthly positions
+          • Long book contribution vs Short book contribution
+
+       C. Stress Period Analysis
+          • 2008 Global Financial Crisis
+          • 2020 COVID crash and recovery
+          • 2022 rate-hike bear market
+          • Annotate cumulative return chart with these periods
+
+       D. Visualisation
+          • plotly: cumulative return — strategy vs SPY (interactive)
+          • ggplot: monthly returns heatmap (year × month grid)
+          • ggplot: drawdown chart
+          • ggplot: long/short contribution stacked bar (monthly)
+          • patchwork: combined layout of above charts
+     ──────────────────────────────────────────────────────────────────────── -->
+
+<!-- TODO: Implement rebalance_portfolio() with inverse vol weighting -->
+
+<!-- TODO: Run backtest loop over training period -->
+
+<!-- TODO: Compute performance metrics table (gt()) -->
+
+<!-- TODO: plotly cumulative return chart vs SPY -->
+
+<!-- TODO: Monthly returns heatmap -->
+
+<!-- TODO: Drawdown chart -->
+
+<!-- TODO: Long/short contribution breakdown -->
+
+<!-- TODO: Stress period annotations -->
+
+<!-- TODO: patchwork combined layout -->
+
+---
+
+# 9. Out-of-Sample Test {#sec-oos}
+
+<!-- ─────────────────────────────────────────────────────────────────────────
+     SECTION 9: OUT-OF-SAMPLE TEST — January 2025 to March 2026
+     Goal: Honest assessment of strategy generalisation beyond training data.
+     NOTE: Kalman W/V parameters and theta_base estimated on training only.
+           Scaling parameters (mean, sd) from training applied to test.
+           Cluster model fit on training, applied forward without refitting.
+     Content to write:
+       A. OOS Execution
+          • Apply pre-fit Kalman filter parameters to test data
+          • Apply pre-fit scaling parameters to test features
+          • Apply pre-fit cluster centroids to assign test month labels
+          • Generate signals and positions identically to training logic
+
+       B. Performance Metrics (same set as Section 8)
+          • Cumulative return vs SPY
+          • Sharpe ratio, max drawdown, information ratio
+          • Win rate
+
+       C. Long-Only vs Long-Short Comparison
+          • Run long-only version (no short book, flat when Defensive)
+          • Compare: long-short vs long-only vs SPY
+          • Quantify value added by shorting the Defensive cluster
+
+       D. Honest Assessment
+          • If OOS underperforms, explain using cluster stability analysis
+          • Did regime labels shift in 2025? Compare centroids
+          • When does the strategy fail: VIX > 40, silhouette < 0.3?
+          • Regime detection lag vs rapid market moves
+
+       E. Visualisation
+          • plotly: OOS cumulative return — strategy vs SPY (interactive)
+          • ggplot: OOS monthly returns heatmap
+          • ggplot: long-short vs long-only vs SPY comparison chart
+     ──────────────────────────────────────────────────────────────────────── -->
+
+<!-- TODO: Apply pre-fit model to test data (no refitting) -->
+
+<!-- TODO: Generate OOS positions and NAV -->
+
+<!-- TODO: Compute OOS performance metrics table (gt()) -->
+
+<!-- TODO: Long-only vs long-short comparison -->
+
+<!-- TODO: plotly OOS cumulative return chart vs SPY -->
+
+<!-- TODO: OOS monthly returns heatmap -->
+
+<!-- TODO: Long-short vs long-only vs SPY comparison chart -->
+
+<!-- TODO: Honest narrative assessment of OOS performance -->
+
+---
+
+# 10. Circle Back {#sec-circle-back}
+
+<!-- ─────────────────────────────────────────────────────────────────────────
+     SECTION 10: CIRCLE BACK
+     Goal: Return to the original question — does this strategy justify
+           paying active management fees over holding SPY? Provide a
+           balanced, intellectually honest answer.
+     Content to write:
+       A. What the Strategy Learned
+          • Which regime signals were most predictive?
+          • Which ETFs drove long-book returns? Short-book returns?
+          • Did the Kalman innovation exit genuinely add value vs
+            holding through the regime change?
+
+       B. When Clustering Fails
+          • VIX > 40: panic regimes don't cluster cleanly
+          • Silhouette width < 0.3: regime ambiguity, signals unreliable
+          • Rapid regime transitions (days, not months): monthly
+            rebalancing introduces dangerous lag
+          • Extended Neutral periods: strategy flat, opportunity cost
+
+       C. Limitations
+          • No transaction costs or slippage modelled
+          • Short-selling constraints ignored (borrow cost, availability)
+          • Margin call constraints not modelled (per professor confirmation)
+          • Single-model risk: K-means is sensitive to initialisation
+          • Look-ahead audit: state any remaining risks of data leakage
+
+       D. Inversion: What Would Kill This Strategy?
+          • Persistent low-volatility regime (all clusters merge)
+          • Structural break in sector correlations (e.g. AI disruption)
+          • Central bank intervention compressing cross-sector dispersion
+          • ETF proliferation reducing signal in individual sector ETFs
+
+       E. Active Management Value — Final Answer
+          • Does the Information Ratio justify active fees?
+          • Under what market conditions does active add value here?
+          • Honest recommendation: when to use this vs hold SPY
+     ──────────────────────────────────────────────────────────────────────── -->
+
+<!-- TODO: Write "What the strategy learned" narrative -->
+
+<!-- TODO: Write "When clustering fails" with quantitative thresholds -->
+
+<!-- TODO: Write limitations section -->
+
+<!-- TODO: Write inversion / failure mode analysis -->
+
+<!-- TODO: Write final active management value assessment -->
+
+---
+
+# References {#sec-references}
+
+<!-- ─────────────────────────────────────────────────────────────────────────
+     REFERENCES
+     Required citations:
+       • Kalman (1960) — original Kalman filter paper
+       • Harvey (1989) — Time Series Models, state space in econometrics
+       • Durbin & Koopman (2012) — State Space Methods by State Space
+       • Hartigan & Wong (1979) — K-means algorithm
+       • Avellaneda & Lee (2010) — stat arb, state space in finance
+     ──────────────────────────────────────────────────────────────────────── -->
+
+<!-- TODO: Create references.bib with all required citations -->
+<!-- TODO: Re-add  bibliography: references.bib  to YAML header once .bib file exists -->
+<!-- TODO: Restore ::: {#refs} ::: div once bibliography is wired up -->
