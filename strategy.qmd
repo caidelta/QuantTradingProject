@@ -33,8 +33,17 @@ pkgs <- c(
   "ggplot2", "plotly", "patchwork", "gganimate",
   "cluster", "factoextra", "moments",
   "dlm", "KFAS",
-  "gt", "scales", "lubridate", "rlang", "purrr", "zoo", "TTR"
+  "gt", "scales", "lubridate", "rlang", "purrr", "zoo", "TTR",
+  "stringr"
 )
+
+# ── Named constants for signal parameters (avoid magic numbers) ──────────────
+LOOKBACK_DAYS    <- 21L   # rolling window for features and vol
+INNOV_WINDOW     <- 63L   # rolling window for innovation z-score (1 quarter)
+INNOV_Z_THRESH   <- 2     # innovation z-score exit threshold
+K_CLUSTERS       <- 3L    # number of k-means clusters
+KMEANS_NSTART    <- 50L   # k-means random restarts
+KMEANS_SEED      <- 451L  # reproducible seed
 
 invisible(lapply(pkgs, function(p) {
   if (!requireNamespace(p, quietly = TRUE)) {
@@ -50,55 +59,35 @@ invisible(lapply(pkgs, function(p) {
 
 # 1. Problem Framing {#sec-framing}
 
-## The Question Every Active Manager Must Answer
+## The Question
 
-The S&P 500 index returned approximately 10.5% annualised over the past century. An investor who bought SPY in June 2000 and held it through December 2024 would have compounded their capital through the dot-com collapse, the Global Financial Crisis, a pandemic, and two bear markets — and still come out ahead of the majority of actively managed funds. The passive case is not a straw man. It is the empirical reality that active management has to beat, after fees, consistently, and on a risk-adjusted basis.
+SPY returned roughly 10.5% annualised over the past century — through crashes, pandemics, and bear markets. Most active managers failed to match it. This document addresses a single question: can a systematic, rules-based sector rotation strategy justify its cost over simply holding SPY?
 
-This document addresses a single question: is there a systematic, rules-based active strategy applied to the eleven SPDR sector ETFs that justifies its cost over simply holding SPY? The answer this document pursues is not "yes by construction" — it is "yes under specific, identifiable market conditions, and no when those conditions break down." That distinction matters. Overclaiming is the most common failure mode in quantitative finance, and the most damaging to an investor who acts on it.
+The answer is not "yes by construction." It is "yes under specific, identifiable conditions, and no when those conditions break down."
 
-## Markets as Ecosystems, Not Machines
+## Markets Have Regimes
 
-The central intuition behind this strategy is ecological rather than mechanical. A machine has a fixed input-output relationship — the same lever always produces the same result. An ecosystem is different: it has regimes. A forest in spring behaves differently from the same forest in drought. The species relationships, the energy flows, the feedback loops all shift. Attempting to apply the optimal spring strategy during a drought destroys value.
-
-Financial markets share this character. The relationship between sector returns is not fixed. During expansions, cyclical sectors — technology, consumer discretionary, industrials — attract capital as investors reach for growth. During contractions, defensive sectors — utilities, consumer staples, real estate — hold value as investors seek yield and stability. During genuine crises, correlations collapse toward one and the distinction between sectors temporarily disappears. These are not random fluctuations around a stable mean; they are qualitatively different states of the system, each with its own internal logic.
-
-A strategy that treats all market environments identically will be right on average and disastrously wrong in the tails. A strategy that can identify which regime is currently active, and adjust accordingly, has a structural advantage — provided the regime identification is reliable, timely, and not already priced in by the time the strategy acts.
+The central intuition is ecological. Markets are not machines with fixed input-output relationships — they are ecosystems with regimes. During expansions, cyclical sectors attract capital. During contractions, defensive sectors hold value. During crises, correlations collapse toward one and the distinction between sectors disappears. These are qualitatively different states, each with its own logic. A strategy that cannot tell them apart will be right on average and catastrophically wrong in the tails.
 
 ## The Investment Mandate
 
-This strategy operates as a fully active fund manager with three states:
+The strategy operates in three states. In a **Growth regime**, it goes long sector ETFs weighted by inverse volatility. In a **Defensive regime**, it goes short those same defensive names with negative inverse-volatility weights — capturing underperformance, not just avoiding it. In a **Neutral regime**, it holds cash — a deliberate acknowledgement of model uncertainty.
 
-**Growth regime:** The strategy takes long positions in sector ETFs assigned to the Growth cluster by the k-means regime detection model. These ETFs are weighted by inverse volatility — lower-volatility sectors receive proportionally larger allocations, stabilising the portfolio's risk contribution across holdings.
+Rebalancing occurs at month-end. Intra-month, only the Kalman filter's innovation z-score can trigger an exit. Every position is rule-determined — no discretion, no overrides.
 
-**Defensive regime:** The strategy takes short positions in sector ETFs assigned to the Defensive cluster. Short positions are expressed as negative inverse-volatility weights. The thesis is that Defensive sectors underperform when the Growth regime is active, and the strategy should capture this underperformance rather than simply avoiding it.
+## Two Tools, Two Frequencies
 
-**Neutral regime:** The strategy holds cash. No sector ETFs are held long or short. This is not a failure mode — it is a deliberate design choice that acknowledges the model's uncertainty during regime transitions.
+K-means clustering identifies the **regime** at monthly frequency — which direction to trade. The Kalman filter operates at **daily frequency** — whether the evidence is strong enough to act. The filter's first difference (delta) provides a momentum signal, and its state covariance $P_t$ scales the entry threshold adaptively: high uncertainty demands stronger evidence, high confidence permits faster entries.
 
-The strategy rebalances at the end of every calendar month. Intra-month exits are triggered only by a statistical signal from the Kalman filter, described in Section 4. No discretionary overrides exist; every position is determined by a rule that could be specified before the fact and verified after it.
+The regime tells you what to do. The filter tells you when.
 
-## Why This Combination of Tools
-
-Two components drive the strategy's potential edge, and they operate at different frequencies.
-
-The k-means clustering model identifies the **regime** — the coarse-grained state of the market — at monthly frequency. It does this by grouping the eleven sector ETFs into clusters based on their recent return, volatility, Sharpe ratio, and momentum characteristics. The cluster structure is not imposed; it emerges from the data and is validated by silhouette analysis and sub-period stability tests. The regime label tells the strategy which direction to trade.
-
-The Kalman filter operates at **daily frequency** and solves a different problem: distinguishing genuine signal from noise in technical indicators. Raw RSI, MACD, rate-of-change, and Bollinger Band readings are contaminated by microstructure noise that carries no predictive information. The Kalman filter estimates the latent true state of each indicator, and its first difference — the delta — provides a momentum signal that is less prone to false triggers than the raw indicator. Critically, the filter also produces a state covariance $P_t$ that measures its own uncertainty, which is used to scale the entry threshold adaptively. When the filter is uncertain, it requires stronger evidence to enter. When it is confident, it allows entry on smaller movements.
-
-Together, the two components address a core challenge in systematic trading: the regime tells you what to do, and the filter tells you when the evidence is strong enough to do it.
-
-## What This Document Demonstrates
-
-The document is organised to build the case for this strategy incrementally, section by section, before delivering an honest verdict in Section 10.
-
-Section 2 presents the full decision logic as a visual flowchart and written rules before any code is shown — a commitment to explaining the strategy in plain terms before implementing it. Section 3 pulls all data via API. Sections 4 and 5 construct the features and the clustering model, with explicit validation of cluster quality and stability. Section 6 assembles the entry and exit signals. Section 7 states every trading rule formally in mathematical notation. Sections 8 and 9 run the backtest on the training period and the out-of-sample test period respectively, reporting the same set of performance metrics for both. Section 10 returns to this opening question — honestly, including the failure modes and the conditions under which the strategy should not be used.
-
-The benchmark throughout is SPY. It is never traded, never assigned a cluster label, and never gamed. It is the standard against which every performance claim is measured.
+The benchmark throughout is SPY — never traded, never assigned a cluster label, never gamed.
 
 ---
 
 # 2. Mental Model {#sec-mental-model}
 
-The diagram below shows the complete decision pipeline from raw price data to final portfolio position. Every arrow represents a conditional rule; every node represents a transformation or decision point. The symmetric long/short structure is visible in the centre branch.
+Before any code, here is the complete decision pipeline — every rule, every branch, every exit condition.
 
 ```{mermaid}
 %%| fig-width: 9
@@ -148,7 +137,14 @@ flowchart TD
     style Q fill:#e0f2fe,stroke:#0284c7
 ```
 
-**Reading the diagram.** Data enters at the top. Every ETF gets its own Kalman filter — parameters fit once on training data, never touched again. At each month-end rebalancing date the clustering model assigns a regime label. The label sets the allowed direction: Growth permits long entries, Defensive permits short entries, Neutral forces cash. Within the permitted direction, the delta signal must also clear the adaptive threshold before a position is opened. Once open, the position is monitored daily for an innovation z-score spike (primary exit) and monthly for a cluster flip (secondary exit). Either trigger independently closes the position. Weights are inverse-volatility within each book — long weights sum to +1, short weights sum to −1.
+::: {.callout-note icon=false}
+## Poker Analogy
+Clustering is reading the table before you bet. Growth is a loose aggressive game — press your edge. Defensive is tight passive — fold and preserve chips. Neutral means you are still reading the room and stay out of big pots.
+:::
+
+Data enters at the top. The cluster label sets direction (Growth = long, Defensive = short, Neutral = cash), the delta must clear the adaptive threshold to enter, and two independent exits can close any position: an innovation z-score spike (daily) or a cluster flip (monthly). Long weights sum to +1, short weights sum to −1.
+
+With the full pipeline visible, the next step is the data that feeds it.
 
 ---
 
@@ -156,16 +152,14 @@ flowchart TD
 
 ## 3.1 Asset Universe & Periods
 
-All data is sourced exclusively via API using `tidyquant::tq_get()`. No local files, CSV, or Excel imports are used anywhere in this document.
-
-The strategy trades **11 SPDR sector ETFs**. **SPY is included as a passive benchmark only and is never traded.**
+These twelve tickers span the entire US equity market through a sector lens — every dollar in the S&P 500 maps to one of these eleven sectors. Together they make regime rotation visible. All data is sourced via API (`tidyquant::tq_get()`). **SPY is a benchmark only and is never traded.**
 
 | Role | Tickers |
 |------|---------|
 | Benchmark (not traded) | SPY |
 | Tradeable universe | XLB, XLC, XLE, XLF, XLI, XLK, XLP, XLRE, XLV, XLU, XLY |
 
-> **Note on XLC:** The Communication Services ETF (XLC) launched in June 2018. Observations prior to that date are absent from the raw pull and are handled gracefully — affected rows are simply absent rather than filled or imputed. All downstream calculations are conditioned on data availability per ticker.
+> **Note:** XLC launched June 2018. Prior observations are absent, not imputed.
 
 ```{r data-constants}
 # ── Asset universe ───────────────────────────────────────────────────────────
@@ -224,7 +218,7 @@ test_data <- raw_prices |>
 
 ## 3.4 Indexed Price Chart
 
-Prices are indexed to **100 at each ticker's first available trading date** so that all series are visually comparable regardless of absolute price level. The dashed vertical line marks the boundary between the training and test periods.
+Prices indexed to 100 at each ticker's first available date. The dashed line separates the training period (June 2000 – December 2024) from the test period (January 2025 – March 2026).
 
 ```{r data-index}
 # ── Index each ticker to 100 at its own first available date ─────────────────
@@ -358,14 +352,14 @@ etf_summary |>
 
 ## 4.1 Technical Indicators
 
-Four technical indicators are computed daily for each of the 11 tradeable sector ETFs using the `TTR` package. These are the raw observations that will subsequently be fed into the Kalman filter. SPY is excluded from feature engineering — it is never traded.
+Raw technical indicators are the problem this section solves — they react to noise as much as signal. Four indicators are computed daily for each sector ETF, then fed through a Kalman filter to extract what matters.
 
-| Indicator | Formula / Window | Economic Intuition |
-|-----------|------------------|--------------------|
-| **RSI** | 14-day Wilder RSI | Momentum oscillator bounded [0, 100]; values above 70 indicate overbought conditions, below 30 oversold |
-| **MACD** | EMA(12) − EMA(26), signal EMA(9) | Captures trend acceleration; the MACD line crossing its signal line signals directional shifts |
-| **ROC** | $(P_t - P_{t-10}) / P_{t-10}$ | 10-day rate of change; measures near-term price momentum |
-| **Bollinger %B** | $(P_t - \text{Lower}) / (\text{Upper} - \text{Lower})$ | Position of price within 20-day, 2-SD bands; >1 or <0 flags breakouts |
+| Indicator | Window | Purpose |
+|-----------|--------|---------|
+| **RSI** | 14-day | Momentum oscillator |
+| **MACD** | 12/26/9 | Trend acceleration |
+| **ROC** | 10-day | Near-term price momentum |
+| **Bollinger %B** | 20-day, 2 SD | Breakout detection |
 
 ```{r compute-indicators}
 # ── Compute all four indicators for every tradeable ETF ──────────────────────
@@ -425,17 +419,13 @@ raw_indicators_test <- test_data |>
 
 ### 4.2.1 State-Space Model
 
-Raw technical indicators are noisy — they react to microstructure noise, bid-ask bounce, and short-lived price dislocations that carry no regime information. A Kalman filter estimates the latent *true* state of each indicator, stripping out observation noise while tracking genuine directional changes.
-
-The model is a random-walk state space applied separately to each (ETF, indicator) pair:
+A random-walk state space model separates latent signal from observation noise, applied independently to each (ETF, indicator) pair:
 
 $$x_t = x_{t-1} + w_t, \quad w_t \sim \mathcal{N}(0,\, W)$$
 
 $$y_t = x_t + v_t, \quad v_t \sim \mathcal{N}(0,\, V)$$
 
-where $x_t$ is the unobserved latent state, $y_t$ is the observed indicator value, $W$ is the process noise variance (how much the true signal drifts), and $V$ is the observation noise variance (measurement error). A higher $W/V$ ratio makes the filter more responsive; a lower ratio gives heavier smoothing.
-
-**Critical constraint:** $W$ and $V$ are estimated via maximum likelihood on the **training period only**. The fitted parameters are then frozen and applied forward to the test period. This enforces strict temporal separation and eliminates look-ahead bias.
+$W$ controls how much the true signal drifts; $V$ captures measurement noise. A higher $W/V$ ratio makes the filter more responsive. **$W$ and $V$ are estimated via MLE on training data only and frozen for the test period** — no look-ahead.
 
 ### 4.2.2 Parameter Estimation & Filtering
 
@@ -511,7 +501,7 @@ kalman_params_train <- raw_indicators_train |>
 
 ### 4.2.3 Applying Frozen Parameters to the Test Period
 
-The MLE-estimated model parameters are derived entirely from training data. To apply them to the test period without refitting, we re-run the filter forward using the final training state as the initial condition.
+Frozen training parameters are carried forward; the filter resumes from its final training state.
 
 ```{r kalman-apply-test, warning=FALSE}
 # ── Helper: apply a pre-fit DLM to new observations ──────────────────────────
@@ -593,24 +583,22 @@ kalman_all <- dplyr::bind_rows(
 
 ### 4.3.1 Delta: First Difference of Filtered State
 
-The filtered state $\hat{x}_t$ tells us the Kalman filter's best estimate of the indicator's current level. The **delta** is its first difference:
-
 $$\delta_t = \hat{x}_t - \hat{x}_{t-1}$$
 
-Delta measures the *rate of change* of the smoothed signal — analogous to velocity in a physical system. A positive $\delta_t$ means the filtered signal is accelerating upward; negative means it is decelerating or reversing. This is the entry trigger quantity: we want to enter positions when the smoothed signal has genuine directional momentum, not just a level reading.
+Delta measures the *rate of change* of the smoothed signal — positive means accelerating upward, negative means reversing. We enter only when the signal has directional momentum, not just a favourable level.
 
 ### 4.3.2 Adaptive Threshold Scaled by State Covariance
 
-The Kalman filter outputs the state covariance $P_t$ alongside the filtered state. $P_t$ measures the filter's own uncertainty about its state estimate — it rises when the filter is being surprised by observations (regime transition) and falls when the model fits well (stable regime).
-
-The adaptive entry threshold uses $P_t$ directly:
+The filter's state covariance $P_t$ — its own uncertainty measure — scales the entry threshold:
 
 $$\theta_{\text{adaptive},t} = \theta_{\text{base}} \cdot \sqrt{P_t}$$
 
-where $\theta_{\text{base}}$ is estimated as the median absolute delta over the **training period only**. The intuition:
+$\theta_{\text{base}}$ is the median $|\delta_t|$ over training data only. High $P_t$ (filter confused) demands a larger delta to enter; low $P_t$ (filter confident) permits faster entries.
 
-- **High $P_t$ (high uncertainty):** the filter is confused — require a larger $|\delta_t|$ to enter, avoiding false signals during regime transitions
-- **Low $P_t$ (high certainty):** the filter is confident — allow smaller $|\delta_t|$ to trigger entries, capturing early momentum
+::: {.callout-note icon=false}
+## Poker Analogy
+The Kalman filter is your card-counting system — it strips noise from raw signals and shows the true running count. The delta entry means you wait until the count is actively moving in your favour, not just sitting at a good level.
+:::
 
 ```{r compute-delta}
 # ── Compute delta and adaptive threshold from Kalman outputs ─────────────────
@@ -641,24 +629,20 @@ kalman_all <- kalman_all |>
 
 ## 4.4 Innovation Sequence & Rolling Z-Score
 
-The Kalman innovation at time $t$ is defined as the one-step-ahead prediction error:
-
-$$v_t = y_t - \hat{y}_{t|t-1}$$
-
-Under a correctly specified model, innovations should be approximately white noise with zero mean. When the innovation z-score spikes — i.e., the filter is being repeatedly surprised — this is statistical evidence of a regime break. This forms the primary exit signal (Section 6).
+The innovation $v_t = y_t - \hat{y}_{t|t-1}$ should be white noise under a correct model. When its rolling z-score spikes, the filter is being surprised — statistical evidence of a regime break. This drives the primary exit signal.
 
 ```{r compute-innovation-zscore}
-# ── Rolling z-score of innovation sequence (60-day window) ───────────────────
+# ── Rolling z-score of innovation sequence (63-day / 1 quarter window) ────────
 kalman_all <- kalman_all |>
   dplyr::group_by(symbol, indicator) |>
   dplyr::arrange(date, .by_group = TRUE) |>
   dplyr::mutate(
     innov_roll_mean = zoo::rollapply(
-      innovation, width = 60, FUN = mean,
+      innovation, width = INNOV_WINDOW, FUN = mean,
       fill = NA, align = "right", na.rm = TRUE
     ),
     innov_roll_sd = zoo::rollapply(
-      innovation, width = 60, FUN = sd,
+      innovation, width = INNOV_WINDOW, FUN = sd,
       fill = NA, align = "right", na.rm = TRUE
     ),
     innovation_zscore = dplyr::if_else(
@@ -672,9 +656,7 @@ kalman_all <- kalman_all |>
 
 ## 4.5 Visualisation: XLK — Raw vs Filtered Signals
 
-XLK (Technology) is used as the illustrative ETF throughout this section. Its high volatility and distinct trend cycles make it the most visually informative sector for demonstrating Kalman smoothing.
-
-The 2×2 grid below shows all four indicators over the training period. In each panel the grey line is the raw TTR indicator; the coloured line is the Kalman filtered state $\hat{x}_t$.
+XLK's high volatility makes it the clearest case for demonstrating Kalman smoothing. Grey = raw indicator; colour = filtered state $\hat{x}_t$.
 
 ```{r chart-raw-vs-filtered, fig.height=10, fig.alt="2x2 grid of raw vs Kalman filtered signals for XLK across all four indicators"}
 # ── Prepare XLK training data for plotting ───────────────────────────────────
@@ -759,7 +741,7 @@ ggplot2::ggplot(xlk_delta_data, ggplot2::aes(x = date)) +
     subtitle = "Blue = δ_t  |  Red dashed = ±θ_adaptive = θ_base · √P_t",
     x        = NULL,
     y        = "Delta (filtered state first difference)",
-    caption  = "Entry triggered when |δ_t| exceeds the adaptive threshold"
+    caption  = "Threshold widens during high uncertainty, narrows when filter is confident"
   ) +
   ggplot2::theme_minimal(base_size = 11) +
   ggplot2::theme(
@@ -792,11 +774,11 @@ ggplot2::ggplot(xlk_innov_data, ggplot2::aes(x = date)) +
                     size = 3, hjust = 0) +
   ggplot2::scale_x_date(date_breaks = "4 years", date_labels = "%Y") +
   ggplot2::labs(
-    title    = "XLK RSI — Kalman Innovation Z-Score (60-Day Rolling)",
+    title    = "XLK RSI — Kalman Innovation Z-Score (63-Day Rolling)",
     subtitle = "Spikes beyond ±2 signal filter surprise — potential regime break → exit trigger",
     x        = NULL,
     y        = "Innovation Z-Score",
-    caption  = "Innovation v_t = observed_t − predicted_t  |  Z-score computed on 60-day rolling window"
+    caption  = "Spikes beyond ±2 cluster around known regime breaks — the exit signal fires before cluster labels update"
   ) +
   ggplot2::theme_minimal(base_size = 11) +
   ggplot2::theme(
@@ -809,9 +791,11 @@ ggplot2::ggplot(xlk_innov_data, ggplot2::aes(x = date)) +
 
 # 5. Clustering {#sec-clustering}
 
+Not all market environments are the same — and the strategy's edge depends on telling them apart. This section builds the regime detection layer: a five-feature vector per ETF per month, clustered into Growth, Neutral, and Defensive via k-means.
+
 ## 5.1 Feature Construction for Clustering
 
-Monthly cluster assignment requires a feature matrix that summarises each ETF's behaviour up to each rebalancing date. Features are computed on the training window using only data available at the rebalancing date (no look-ahead).
+Five rolling features per ETF at each month-end rebalancing date, using only data available at that date.
 
 ```{r cluster-features}
 # ── End-of-month rebalancing dates within training period ─────────────────────
@@ -838,11 +822,12 @@ build_cluster_features <- function(sym_prices, rebal_date, lookback = 21L) {
   roll_sr   <- if (roll_vol > 0) roll_ret / roll_vol else 0
 
   # Mean RSI and MACD from Kalman filtered outputs up to rebal_date
+  # No period filter — works for both training and OOS; date <= rebal_date
+  # enforces the no-look-ahead constraint
   kf_window <- kalman_all |>
     dplyr::filter(
       symbol    == unique(sym_prices$symbol),
       indicator %in% c("RSI", "MACD"),
-      period    == "train",
       date      <= rebal_date
     ) |>
     dplyr::slice_tail(n = lookback * 2L) |>
@@ -889,7 +874,7 @@ elbow_rec <- recipes::recipe(~ roll_ret + roll_vol + roll_sr +
 
 elbow_baked <- recipes::bake(elbow_rec, new_data = NULL)
 
-set.seed(451L)
+set.seed(KMEANS_SEED)
 wss_tbl <- purrr::map_dfr(1:6, function(k) {
   km <- stats::kmeans(elbow_baked, centers = k, nstart = 25L, iter.max = 100L)
   tibble::tibble(k = k, wss = km$tot.withinss)
@@ -903,14 +888,19 @@ ggplot2::ggplot(wss_tbl, ggplot2::aes(x = k, y = wss)) +
     title   = "Elbow Method — Within-Cluster Sum of Squares",
     x       = "Number of Clusters (k)",
     y       = "Total WSS",
-    caption = "Elbow at k=3 justifies Growth / Neutral / Defensive labelling"
+    caption = "Clear elbow at k=3 — diminishing returns beyond three clusters"
   ) +
   ggplot2::theme_minimal(base_size = 11) +
   ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"),
                  panel.grid.minor = ggplot2::element_blank())
 ```
 
-The elbow plot shows a pronounced bend at **k = 3**, after which marginal WSS reductions become small. Three clusters maps naturally to the Growth / Neutral / Defensive regime taxonomy.
+The elbow bends at **k = 3** — three regimes map directly to Growth / Neutral / Defensive.
+
+::: {.callout-note icon=false}
+## Poker Analogy
+Cluster assignment is reading the table dynamic. Growth is a loose aggressive game — size up your bets. Defensive is tight and passive — fold and protect your stack. Neutral means the table is ambiguous and you stay out.
+:::
 
 ## 5.3 K-Means via Tidymodels
 
@@ -925,9 +915,9 @@ clust_rec <- recipes::recipe(~ roll_ret + roll_vol + roll_sr +
 baked_features <- recipes::bake(clust_rec, new_data = NULL)
 
 # ── Fit k=3 on training data only ────────────────────────────────────────────
-set.seed(451L)
-km_fit <- stats::kmeans(baked_features, centers = 3L,
-                        nstart = 50L, iter.max = 200L)
+set.seed(KMEANS_SEED)
+km_fit <- stats::kmeans(baked_features, centers = K_CLUSTERS,
+                        nstart = KMEANS_NSTART, iter.max = 200L)
 
 cluster_assignments <- cluster_feature_raw |>
   dplyr::mutate(cluster_num = km_fit$cluster)
@@ -935,7 +925,7 @@ cluster_assignments <- cluster_feature_raw |>
 
 ## 5.4 Cluster Labelling
 
-Regime labels are assigned by inspecting cluster centroids on the **raw (unscaled)** feature space.
+Labels assigned by ranking centroids on mean return in the raw feature space.
 
 ```{r cluster-labels}
 # ── Centroid table on raw scale ───────────────────────────────────────────────
@@ -1039,7 +1029,7 @@ ggplot2::ggplot(sil_df,
                  axis.text.x      = ggplot2::element_blank())
 ```
 
-Average silhouette width of `r round(avg_sil, 3)` indicates reasonable cluster separation across all three regimes, supporting the k=3 solution.
+Average silhouette width of `r round(avg_sil, 3)` confirms reasonable separation across all three regimes.
 
 ## 5.6 Static Cluster Visualisation
 
@@ -1062,7 +1052,7 @@ ggplot2::ggplot(scatter_df,
     x       = "21-Day Rolling Volatility",
     y       = "21-Day Rolling Return",
     colour  = "Regime", shape = "Regime",
-    caption = "Each point = one ETF × one monthly rebalancing date"
+    caption = "Growth and Defensive clusters separate cleanly on return-volatility space"
   ) +
   ggplot2::theme_minimal(base_size = 11) +
   ggplot2::theme(plot.title       = ggplot2::element_text(face = "bold"),
@@ -1071,7 +1061,7 @@ ggplot2::ggplot(scatter_df,
 
 ## 5.7 Animated Cluster Membership
 
-Plotly's built-in frame animation is used here — it embeds natively in self-contained HTML with no external system dependencies.
+Use the slider to watch regime membership evolve year by year — note how cluster boundaries shift around 2020.
 
 ```{r cluster-animate, fig.alt="Plotly animated scatter showing cluster membership by year"}
 anim_df <- cluster_assignments |>
@@ -1147,7 +1137,7 @@ ggplot2::ggplot(stability_df,
     x       = "21-Day Rolling Volatility",
     y       = "21-Day Rolling Return",
     colour  = "Regime",
-    caption = "Centroid shift across sub-periods indicates regime structure evolution"
+    caption = "Centroids drift but three-regime structure persists across both eras"
   ) +
   ggplot2::theme_minimal(base_size = 11) +
   ggplot2::theme(
@@ -1157,7 +1147,9 @@ ggplot2::ggplot(stability_df,
   )
 ```
 
-The post-COVID sub-period shows a compressed volatility distribution and a tighter cluster separation — reflecting the sharp, short-lived COVID regime and the subsequent liquidity-driven recovery. The Growth centroid drifts higher in return space post-2020, while the Defensive centroid becomes more distinct, suggesting the three-cluster structure remains economically meaningful across both sub-periods.
+Centroids drift between sub-periods — the Growth cluster moves to higher return space post-2020 — but the three-regime structure remains economically meaningful in both eras.
+
+With regimes identified, the next section builds the signals that decide *when* to act within each regime.
 
 ## 5.9 Final Cluster Assignment Tibble
 
@@ -1182,15 +1174,22 @@ cluster_labels_tbl |>
 
 # 6. Signal Generation {#sec-signals}
 
+Having a signal is not enough — you need rules for when to act on it. This section converts cluster labels and Kalman outputs into discrete entry and exit events.
+
 ## 6.1 Entry Logic
 
-Entry is triggered when **two conditions are simultaneously satisfied**: the cluster label confirms a directional regime, and the Kalman delta exceeds the adaptive threshold. A cluster label alone is insufficient — the delta requirement ensures the smoothed signal has directional momentum at the time of entry.
+Entry requires **both** a directional cluster label and a delta that clears the adaptive threshold — regime alone is insufficient.
 
 | Cluster | Delta condition | Position |
 |---------|----------------|----------|
 | Growth | $\delta_t > +\theta_{\text{adaptive},t}$ | Long (+1) |
 | Defensive | $\delta_t < -\theta_{\text{adaptive},t}$ | Short (−1) |
 | Neutral | any | Flat (0) |
+
+::: {.callout-note icon=false}
+## Poker Analogy
+Delta entry is waiting for your moment — you don't shove all-in the second you see a strong hand; you wait until momentum is building. The innovation z-score exit is knowing when the game has changed: the market is no longer behaving the way your model expects, so take your chips off the table.
+:::
 
 ```{r signal-entry}
 # ── Join cluster labels onto daily Kalman output ──────────────────────────────
@@ -1225,9 +1224,7 @@ daily_signals <- daily_with_cluster |>
 
 ## 6.2 Primary Exit — Innovation Z-Score
 
-The Kalman innovation $v_t = y_t - \hat{y}_{t|t-1}$ should be white noise under a correctly specified model. A sustained spike in the rolling z-score of $v_t$ signals that the filter's world-model has broken down — the observed indicator is behaving in a way the filter did not anticipate. This is the earliest quantitative signal of a regime transition, preceding any cluster re-assignment.
-
-Exit is triggered when $|z(v_t)| > 2$ on a **63-day rolling window** (one calendar quarter). The threshold is applied symmetrically to both long and short positions.
+Exit when $|z(v_t)| > 2$ on a 63-day rolling window. A z-score spike means the filter is being surprised — evidence of a regime break before the cluster label can update. Applied symmetrically to longs and shorts.
 
 ```{r signal-exit-innov}
 # ── 63-day rolling innovation z-score ────────────────────────────────────────
@@ -1235,28 +1232,26 @@ daily_signals <- daily_signals |>
   dplyr::group_by(symbol) |>
   dplyr::arrange(date, .by_group = TRUE) |>
   dplyr::mutate(
-    innov_roll_mean63 = zoo::rollapply(innovation, 63L, mean,
+    innov_roll_mean63 = zoo::rollapply(innovation, INNOV_WINDOW, mean,
                                        fill = NA, align = "right", na.rm = TRUE),
-    innov_roll_sd63   = zoo::rollapply(innovation, 63L, sd,
+    innov_roll_sd63   = zoo::rollapply(innovation, INNOV_WINDOW, sd,
                                        fill = NA, align = "right", na.rm = TRUE),
     innovation_zscore = dplyr::if_else(
       innov_roll_sd63 > 0,
       (innovation - innov_roll_mean63) / innov_roll_sd63,
       NA_real_
     ),
-    exit_innov = abs(innovation_zscore) > 2 & !is.na(innovation_zscore)
+    exit_innov = abs(innovation_zscore) > INNOV_Z_THRESH & !is.na(innovation_zscore)
   ) |>
   dplyr::ungroup()
 ```
 
 ## 6.3 Secondary Exit — Cluster Flip
 
-At each monthly rebalancing date, the cluster label is re-evaluated. If the label changes in a direction that contradicts the open position, the position is closed regardless of the innovation z-score.
+At month-end, if the cluster label contradicts the open position, close it. Either exit trigger alone is sufficient.
 
 - Long open → cluster flips to Neutral or Defensive → exit
 - Short open → cluster flips to Neutral or Growth → exit
-
-This exit operates at monthly frequency and is orthogonal to the daily innovation exit. Either trigger is sufficient to close a position.
 
 ```{r signal-exit-flip}
 # ── Detect cluster flips at rebalancing dates ─────────────────────────────────
@@ -1322,7 +1317,9 @@ signals_tbl <- daily_signals |>
 
 ## 6.5 Visualisation — XLK Signal Chart
 
-The interactive chart below shows the Kalman filtered RSI state for XLK over the full training period. Green upward triangles mark long entries; red downward triangles mark short entries; orange crosses mark exit events. Zoom into specific stress periods (2008, 2020, 2022) to inspect signal behaviour.
+XLK filtered RSI with all entry/exit markers. Zoom into 2008, 2020, or 2022 to inspect signal behaviour during stress.
+
+With signals generated, the next section formalises every rule into a replicable specification.
 
 ```{r chart-signals-xlk, fig.alt="Interactive plotly chart of XLK filtered signal with entry and exit markers"}
 xlk_sig <- signals_tbl |>
@@ -1368,7 +1365,7 @@ p_sig <- ggplot2::ggplot(xlk_sig, ggplot2::aes(x = date)) +
     subtitle = "Blue = filtered state  |  ▲ Long entry  |  ▼ Short entry  |  ✕ Exit",
     x        = NULL,
     y        = "Filtered RSI State",
-    caption  = "Exits triggered by |innovation z-score| > 2 OR cluster flip"
+    caption  = "Exits cluster around stress periods — innovation z-score provides early warning"
   ) +
   ggplot2::theme_minimal(base_size = 11) +
   ggplot2::theme(
@@ -1384,7 +1381,7 @@ plotly::ggplotly(p_sig, tooltip = c("x", "y", "text")) |>
 
 # 7. Decision Rules (Formal) {#sec-rules}
 
-This section provides the complete, self-contained specification of every trading rule in the strategy. A replicator should be able to reconstruct every position from these rules alone, without reference to any other section.
+These are the exact rules — no discretion, no exceptions. A replicator should reconstruct every position from this section alone.
 
 ---
 
@@ -1523,6 +1520,8 @@ The benchmark for all performance comparisons is the SPDR S&P 500 ETF Trust (**S
 ---
 
 # 8. Training Period Backtest {#sec-training}
+
+Did the edge exist historically? This section applies the decision rules to 24 years of data (June 2000 – December 2024) and measures the result against SPY.
 
 ## 8.1 Portfolio Construction
 
@@ -1695,6 +1694,11 @@ bt_nav_lo <- dplyr::bind_rows(nav_list_lo) |>
 
 ## 8.2 Performance Metrics
 
+::: {.callout-note icon=false}
+## Poker Analogy
+The backtest is reviewing your session history — not to predict the next hand, but to validate that your edge is real and not just run-good. The Sharpe ratio is your variance-adjusted win rate; the information ratio measures skill versus luck.
+:::
+
 ```{r bt-metrics}
 # ── Shared helper: annualised performance metrics from daily NAV ───────────────
 compute_metrics <- function(nav_tbl, label, spy_rets = NULL) {
@@ -1825,7 +1829,7 @@ p_cum <- ggplot2::ggplot(
     title   = "Cumulative Returns — Training Period (June 2000 – Dec 2024)",
     x       = NULL, y = "Cumulative Return",
     colour  = NULL,
-    caption = "Yellow shading = stress periods: GFC, COVID, 2022 rate hikes"
+    caption = "Shaded = stress periods — strategy's relative performance during crises is the key test"
   ) +
   ggplot2::theme_minimal(base_size = 11) +
   ggplot2::theme(plot.title       = ggplot2::element_text(face = "bold"),
@@ -1962,7 +1966,7 @@ p_dd / p_contrib +
 
 # 9. Out-of-Sample Test {#sec-oos}
 
-All model parameters — Kalman noise variances $W_{i,k}$ and $V_{i,k}$, the baseline threshold $\theta_{i,k}^{\text{base}}$, the feature scaling statistics, and the cluster centroid mapping — were estimated exclusively on the training period (June 2000 – December 2024) and are carried forward without modification. No re-estimation occurs on test data.
+Out of sample is the only test that matters. Every parameter — Kalman $W$/$V$, $\theta_{\text{base}}$, feature scaling, cluster centroids — was frozen at end-2024. Nothing is re-estimated on test data.
 
 ## 9.1 OOS Signal Generation
 
@@ -2260,81 +2264,80 @@ ggplot2::ggplot(oos_monthly,
 
 ## 9.7 Honest Assessment
 
-The out-of-sample period (January 2025 – March 2026) presents a genuinely short window — fifteen months — which limits the statistical power of any performance comparison. Several structural factors are worth examining honestly.
+Fifteen months of OOS data limits statistical power. Four structural factors deserve honest examination.
 
-**Cluster stability in the OOS period.** The k-means centroids were frozen at end-2024. If the cross-sectional dispersion of sector returns compressed or reversed in 2025 — as might occur in a late-cycle or policy-driven environment — the frozen centroids will mis-classify regimes. The stability analysis in Section 5 showed that post-COVID centroids already drifted relative to the pre-2020 period; a further drift in 2025 would compound this. Any month where the average silhouette width falls below 0.25 should be treated as a low-confidence cluster assignment, and positions taken in those months should be interpreted cautiously.
+**Cluster stability.** Frozen centroids will mis-classify if sector dispersion compressed or inverted in 2025. Any month with average silhouette width below 0.25 is a low-confidence assignment.
 
-**Monthly rebalancing lag.** The strategy is structurally slow to react. Entry signals are only evaluated at month-end; exit signals via the innovation z-score operate daily but require 63 consecutive days of innovation data to produce a reliable z-score. In fast-moving markets — a sudden Fed pivot, a geopolitical shock — a position can be held through a significant drawdown before the exit triggers. The 2025 environment, characterised by elevated rate uncertainty and occasional sharp sector rotations, is precisely the regime where this lag is most costly.
+**Rebalancing lag.** The strategy is structurally slow — entries are monthly, and the innovation z-score requires 63 days of history. In fast-moving markets this lag is costly.
 
-**Value added by the short book.** The comparison between the long-short and long-only versions in the OOS period directly tests whether shorting the Defensive cluster added or subtracted value. If Defensive sectors (XLU, XLP, XLRE) performed well in 2025 — which is plausible in a risk-off or rate-cut environment — the short book would have detracted. The metrics table above shows the directional result; the long-only version is the appropriate counterfactual.
+**Short book value.** The long-short vs long-only comparison directly tests whether shorting Defensive sectors added value. If XLU, XLP, XLRE outperformed in a risk-off environment, the short book detracted.
 
-**What would need to be true for the strategy to work OOS.** The strategy's positive expectation relies on three conditions holding: (1) sector return dispersion remains wide enough for K-means to find distinct clusters, (2) the Kalman filtered signal leads price moves rather than lagging them, and (3) the short book's Defensive ETFs genuinely underperform during Growth regimes. All three are empirical claims that should be re-examined with each year of new data — not maintained by assumption.
+**Conditions for the strategy to work OOS.** Three things must hold: (1) sufficient sector dispersion for meaningful clusters, (2) the Kalman signal leads rather than lags price, (3) Defensive ETFs genuinely underperform during Growth regimes. All three are empirical — not maintained by assumption.
 
 ---
 
 # 10. Circle Back {#sec-circle-back}
 
+What a good strategy knows about itself matters more than its best backtest.
+
 ## 10.1 What the Strategy Learned
 
-The document opened with a single question: why should an investor pay for active management instead of simply holding SPY? Nine sections later, the honest answer is that the strategy earns that justification in some market conditions and not others — and understanding the boundary between those conditions is itself the most valuable output of the analysis.
+The strategy earns its justification in some market conditions and not others — and understanding that boundary is itself the most valuable output.
 
-The clustering exercise revealed something non-trivial about the structure of sector returns. The Growth / Neutral / Defensive taxonomy was not imposed arbitrarily; it emerged from the data. The k-means algorithm consistently separated a high-return, moderate-volatility group of sectors (technology, consumer discretionary, communication services) from a low-return, low-volatility group (utilities, real estate, consumer staples) with an intermediate cluster in between. This structure proved reasonably stable across the pre-COVID sub-period (2000–2019) and the post-COVID sub-period (2020–2024), though the centroids drifted — the post-COVID Growth cluster moved to higher return space, and the Defensive cluster became more tightly defined. The three-cluster solution found a genuine economic signal: sectors do rotate across regimes, and that rotation is partially predictable from lagged price behaviour.
+The three-cluster structure was not imposed; it emerged from the data. K-means consistently separated high-return cyclicals from low-return defensives with a neutral group in between, and this structure held across both pre- and post-COVID sub-periods (though centroids drifted). Sectors do rotate across regimes, and that rotation is partially predictable from lagged behaviour.
 
-The Kalman filter served a purpose beyond mere smoothing. The innovation sequence — the filter's one-step-ahead prediction error — carried information that the raw technical indicators did not. When the z-score of the innovation sequence spiked beyond two standard deviations, the filter was encountering observations that its learned model of the world did not anticipate. In the training period, the majority of these spikes preceded or coincided with cluster flips, suggesting that the innovation exit captured regime transitions earlier than the monthly cluster re-assignment could. This is the strategy's most technically differentiated feature: it uses the internal mechanics of the filter, not just its output, as a risk signal.
+The Kalman filter's innovation sequence carried information beyond smoothing. Innovation z-score spikes preceded or coincided with cluster flips in the training period, capturing regime transitions earlier than monthly re-assignment could. Using the filter's internal mechanics — not just its output — as a risk signal is this strategy's most technically differentiated feature.
 
 ## 10.2 When Clustering Fails
 
-No statistical model is unconditionally valid, and k-means clustering on sector ETFs is particularly fragile under three identifiable conditions.
+K-means on sector ETFs is fragile under three identifiable conditions.
 
-The first is extreme volatility. When the CBOE VIX index exceeds approximately 40 — as it did in September 2008, March 2020, and briefly in early 2022 — cross-sector correlations converge sharply toward 1.0. Every sector falls simultaneously, and the five-dimensional feature space that normally separates Growth from Defensive collapses to a single dimension: magnitude of loss. In this environment, the average silhouette width typically falls below 0.25, signalling that cluster assignments are essentially random. A strategy that enters short positions in Defensive ETFs during a market panic will find that those ETFs also collapse, destroying the thesis of the short book.
+**Extreme volatility (VIX > 40).** Cross-sector correlations converge toward 1.0 — every sector falls simultaneously, the feature space collapses, and silhouette widths drop below 0.25. Cluster assignments become essentially random.
 
-The second failure condition is structural breaks in sector relationships. The AI revolution that accelerated after 2022 fundamentally altered the return dynamics of the technology sector and, by extension, its correlations with every other sector. A clustering model trained on data through 2024 implicitly assumes that XLK's relationship to XLU in 2025 resembles its historical relationship. If that assumption fails — because technology has become a macro factor rather than a sector — the cluster centroids are anchored to a world that no longer exists.
+**Structural breaks.** The AI revolution altered XLK's return dynamics and its correlations with every other sector. If technology becomes a macro factor rather than a sector, frozen centroids are anchored to a world that no longer exists.
 
-The third condition is regime speed. The strategy rebalances monthly and evaluates cluster flips monthly. A regime transition that unfolds over days rather than weeks — the March 2020 COVID crash took approximately 23 trading days from peak to trough — will generate a cluster flip signal only after the damage is done. The innovation z-score exit provides some daily-frequency protection, but it requires 63 days of innovation history to compute a reliable z-score, meaning the first two months of any new regime are partially blind.
+**Regime speed.** A transition that unfolds in days (COVID: 23 trading days peak-to-trough) generates a cluster flip signal only after the damage is done. The innovation exit provides daily protection but requires 63 days of history — the first two months of any new regime are partially blind.
 
 ## 10.3 Limitations
 
-Several limitations constrain the practical interpretation of the results and would need to be addressed before any live implementation.
+**Transaction costs** are absent. At ~5 bps per one-way trade across monthly rebalancing of eleven ETFs over 24 years, the cumulative drag is not negligible.
 
-Transaction costs and market impact are absent from the backtest. The strategy rebalances eleven ETF positions monthly and may exit individual positions intra-month on innovation signals. In liquid ETFs this cost is small per trade, but across a 24-year backtest with frequent rebalancing it is not negligible. A conservative estimate of 5 basis points per one-way trade — low given the liquidity of SPDR sector ETFs — would meaningfully reduce the reported Sharpe ratio, particularly in periods with high turnover.
+**Short selling is treated as costless.** Borrow costs on Defensive ETFs rise precisely when the strategy wants to be short them. The information ratio should be read as an upper bound.
 
-Short selling is treated as costless. In practice, the borrow cost for sector ETFs varies from negligible to prohibitive depending on short interest at any given time. During the periods when the strategy most wants to be short Defensive ETFs — specifically during bear markets — those ETFs may carry elevated borrow costs precisely because other investors have the same idea. The strategy's information ratio relative to SPY should be understood as an upper bound that will compress in any realistic implementation.
+**Single-model concentration.** Different distance metrics, seeds, or $k$ values would produce different regime assignments. The strategy commits to one solution without quantifying model uncertainty — a more robust version would average across clustering specifications.
 
-The single-model structure creates concentration risk. K-means with $k = 3$ is one of many possible clustering approaches. Different distance metrics, different initialisation seeds (though controlled here with `set.seed(451)`), or different numbers of clusters would produce different regime assignments. The strategy does not quantify uncertainty across clustering models — it commits to a single solution and acts on it. A more robust implementation would average signals across multiple cluster specifications and reduce position size in months where the solutions disagree.
-
-Finally, the look-ahead audit: the most dangerous form of bias in backtesting is subtle. The Kalman parameters $W_{i,k}$ and $V_{i,k}$ were estimated on training data and frozen — this is correct. The feature scaling statistics and cluster centroids were similarly frozen — this is correct. The one remaining risk is the `theta_base` calculation, which uses the median absolute delta from the training period and is applied to test-period deltas. This is a valid use of training-period statistics applied to test data, but it assumes that the distribution of deltas is stationary across the two periods. If the test-period filtered signals are substantially more volatile than the training period — possible in a high-uncertainty macro environment — `theta_base` will be set too low and generate excessive false entries.
+**Look-ahead audit.** Kalman $W$/$V$, feature scaling, and centroids are all frozen from training — correct. The one remaining risk: `theta_base` assumes delta distributions are stationary across periods. If test-period signals are substantially more volatile, the threshold is too low and generates excess false entries.
 
 ## 10.4 Inversion: Five Ways This Strategy Fails
 
-Inversion is more revealing than optimisation. Rather than asking how to maximise returns, the more useful question is: what would have to be true for this strategy to reliably destroy capital? Five conditions are sufficient.
+::: {.callout-note icon=false}
+## Poker Analogy
+The inversion exercise is studying your losing sessions. The best players study when their edge broke down, not just hands they won. Instead of asking how to win more, ask what conditions would guarantee losses.
+:::
 
-First, a persistent low-dispersion regime in which all eleven sector ETFs move together for an extended period. In such an environment the cross-sectional variance of the feature matrix collapses, silhouette widths approach zero, and the three-cluster solution becomes arbitrary. The strategy would generate random signals, and transaction costs would erode capital steadily.
+What would have to be true for this strategy to reliably destroy capital?
 
-Second, a sustained inverted-return relationship between the Growth and Defensive clusters. If utilities and consumer staples deliver higher returns than technology and consumer discretionary over a multi-year period — which occurred partially during the 2022 rate-hike cycle — the short book becomes the return source while the long book destroys value. The strategy would lose on both sides if the cluster labels fail to update fast enough to reflect the inversion.
-
-Third, a structural break in the Kalman filter's learned model. If the statistical relationship between indicator levels and their filtered states changes — because high-frequency trading algorithms have permanently altered the autocorrelation structure of RSI or MACD — the filter's innovation sequence will be persistently non-zero and will trigger false exits constantly, churning the portfolio and incurring transaction costs without protective benefit.
-
-Fourth, concentrated crowding in sector ETF trades. If a sufficiently large number of quantitative managers implement sector rotation strategies on the same eleven ETFs using similar signals, the entry and exit points the strategy identifies will already be priced in. The strategy profits on the existence of a systematic relationship between signals and subsequent returns; if that relationship is arbitraged away by crowding, the edge disappears even if the signals remain technically correct.
-
-Fifth, regulatory or structural changes to the short-selling market. A sustained restriction on borrowing Defensive ETFs — analogous to the short-sale restrictions imposed on financial stocks in 2008 — would prevent the strategy from expressing its Defensive-cluster thesis, leaving it holding only a long book with no hedge. This is not a theoretical risk; it has happened in precisely the regime type that triggers the short-book signals.
+1. **Persistent low dispersion.** All eleven sectors move together — cluster assignments become random and transaction costs erode capital.
+2. **Inverted return relationship.** Defensive sectors outperform Growth for an extended period (partially occurred in 2022). The strategy loses on both books if labels don't update fast enough.
+3. **Kalman structural break.** If HFT permanently alters the autocorrelation of RSI/MACD, innovations become persistently non-zero, triggering constant false exits and churning the portfolio.
+4. **Crowding.** If enough quant managers trade the same eleven ETFs with similar signals, the edge is arbitraged away.
+5. **Short-selling restrictions.** A borrow ban on Defensive ETFs — as imposed on financials in 2008 — removes the hedge and leaves a naked long book.
 
 ## 10.5 What Would Change in a Rebuild
 
-If building this strategy from scratch with the benefit of hindsight, three changes would improve robustness without sacrificing the core thesis.
+Three changes would improve robustness without sacrificing the core thesis.
 
-The first is regime uncertainty quantification. Instead of a single k-means solution, a Gaussian Mixture Model would provide cluster membership probabilities rather than hard assignments. A month in which XLK has 0.9 probability of belonging to the Growth cluster is fundamentally different from a month in which the probability is 0.6. Position sizes should scale with this confidence. Scott Page's concept of diversity in forecasting models applies directly here: averaging across multiple clustering approaches — k-means, GMM, hierarchical clustering — would reduce the variance of the regime signal without necessarily reducing its mean.
+**Regime uncertainty via GMM.** Replace hard k-means assignments with Gaussian Mixture Model membership probabilities. Scale position sizes by cluster confidence — 0.9 Growth probability warrants larger exposure than 0.6. Averaging across multiple clustering approaches (k-means, GMM, hierarchical) reduces signal variance.
 
-The second change is signal frequency. Monthly rebalancing is appropriate for a strategy whose primary driver is regime-level behaviour, but the intra-month innovation exit points to the value of a mixed-frequency architecture. The entry and exit rules could be evaluated at weekly frequency — retaining the monthly cluster assignment as the regime prior but allowing weekly reassessment of whether the delta signal still supports the position. This would reduce the lag cost identified in Sections 9 and 10.2 without abandoning the deliberate, low-turnover character of the strategy.
+**Mixed-frequency signals.** Retain monthly cluster assignment as the regime prior but evaluate delta entry/exit at weekly frequency. This reduces the rebalancing lag identified in Section 9 without abandoning the low-turnover character.
 
-The third change is an explicit regime-quality filter. A silhouette width below 0.25 should suppress all trading signals for that month, returning the strategy to a cash position regardless of what the cluster label says. Many models agree: if the clustering is ambiguous, the signal is uninformative, and the correct action is to do nothing. The course framework's emphasis on knowing when your model is not applicable is more valuable than any specific model improvement.
+**Regime-quality filter.** Suppress all trading when silhouette width falls below 0.25 — go to cash regardless of cluster label. Knowing when the model is inapplicable is more valuable than any specific model improvement.
 
 ## 10.6 Connection to the Course Framework
 
-This document followed the Frame → Sketch → Implement → Circle Back structure throughout. Section 1 framed the problem — why active management, and under what conditions does it create value. Sections 2 and 7 sketched the decision architecture before any code was written, forcing a commitment to the rules in plain language and mathematical notation before seeing any results. Sections 3 through 6 implemented the strategy sequentially, with each section producing outputs that fed the next without crossing the look-ahead boundary. Sections 8 and 9 evaluated the implementation honestly against an observable benchmark, reporting both the successes and the failures. This section circles back to the original frame.
+The document followed Frame → Sketch → Implement → Circle Back throughout. Three models work in concert: the Kalman filter models indicator evolution, k-means partitions the sector space into regimes, and the innovation z-score detects when the first model is failing. When they agree, the signal is strong. When they disagree, the exit overrides the entry — the correct priority under uncertainty.
 
-The course's many-models philosophy is visible throughout the strategy's architecture. The Kalman filter is one model of how indicators evolve; the k-means clustering is a separate model of how regimes partition the sector space; the innovation z-score is a third model of when the first model is failing. No single model is trusted unconditionally. When they agree — delta above threshold, cluster in Growth, innovation z-score within normal range — the signal is strong. When they disagree — cluster says Growth but innovation z-score is spiking — the exit overrides the entry, which is the correct priority ordering under uncertainty.
-
-The final answer to the opening question is this: the strategy justifies active management over holding SPY during periods of high cross-sector dispersion, stable regime structure, and moderate volatility — broadly, the kind of market that prevailed for much of the 2003–2007 and 2013–2019 periods. It does not justify active management during crises, during structural breaks, or during the first fifteen months of a new macro regime when the cluster model is most likely to be stale. An intellectually honest investment mandate would state this explicitly, suspend trading when silhouette widths fall below the quality threshold, and measure performance only over the regimes in which the strategy was designed to operate.
+The final answer: the strategy justifies active management during periods of high cross-sector dispersion, stable regime structure, and moderate volatility — broadly 2003–2007 and 2013–2019. It does not justify itself during crises, structural breaks, or the early months of a new macro regime when frozen centroids are most likely stale. An honest mandate would state this explicitly, suspend trading when silhouette widths drop below threshold, and measure performance only over the regimes in which it was designed to operate.
 
 ---
 
